@@ -1716,28 +1716,52 @@ mod tests {
         );
     }
 
-    async fn sse_transport_with_live_grant(
+    struct SseGetGate {
+        denials: usize,
+        hits: AtomicUsize,
+    }
+
+    impl wiremock::Respond for SseGetGate {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let hit = self.hits.fetch_add(1, Ordering::SeqCst);
+            if hit < self.denials {
+                ResponseTemplate::new(401).insert_header(
+                    "www-authenticate",
+                    "Bearer realm=\"mcp\", error=\"invalid_token\"",
+                )
+            } else {
+                ResponseTemplate::new(405)
+            }
+        }
+    }
+
+    async fn sse_transport_with_get<R>(
+        get_responder: R,
         denials: usize,
         refresh_steps: Vec<(u16, serde_json::Value)>,
     ) -> (
         Arc<McpOAuthManager>,
         Stub,
         Arc<crate::mcp_transport::SseTransport>,
-    ) {
+    )
+    where
+        R: wiremock::Respond + Send + Sync + 'static,
+    {
         let stub = stub_with(
             Some(serde_json::json!({"client_id": "cid"})),
             refresh_steps,
             Vec::new(),
         )
         .await;
-        // GET on the SSE URL answers 405 (no stream): the transport falls
-        // back to the derived message endpoint, which is the POST leg the
-        // tests below pin. Advertised-endpoint tests seed the bookkeeping
-        // directly (`set_advertised_endpoint_for_test`) instead of racing a
-        // stream reader whose wiremock body EOFs immediately.
+        // GET on the SSE URL answers 405 (no stream) unless the caller
+        // brings its own GET behavior: the transport falls back to the
+        // derived message endpoint, which is the POST leg the tests below
+        // pin. Advertised-endpoint tests seed the bookkeeping directly
+        // (`set_advertised_endpoint_for_test`) instead of racing a stream
+        // reader whose wiremock body EOFs immediately.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/mcp"))
-            .respond_with(wiremock::ResponseTemplate::new(405))
+            .respond_with(get_responder)
             .mount(&stub.mcp)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1794,6 +1818,17 @@ mod tests {
             .expect("transport"),
         );
         (manager, stub, transport)
+    }
+
+    async fn sse_transport_with_live_grant(
+        denials: usize,
+        refresh_steps: Vec<(u16, serde_json::Value)>,
+    ) -> (
+        Arc<McpOAuthManager>,
+        Stub,
+        Arc<crate::mcp_transport::SseTransport>,
+    ) {
+        sse_transport_with_get(wiremock::ResponseTemplate::new(405), denials, refresh_steps).await
     }
 
     async fn send_sse(
@@ -1873,6 +1908,86 @@ mod tests {
             gets,
             vec!["Bearer at-live".to_string()],
             "the stream GET is authenticated from the first connect (every restart re-reads the grant)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sse_get_401_refreshes_once_and_the_next_connect_carries_the_new_bearer() {
+        // Phase-4 matrix: 401 on the STREAM leg. The stream is pre-write
+        // and restartable, so the 401 must (a) fail this connect honestly,
+        // (b) refresh the grant best-effort, and (c) the very next connect
+        // must re-read the handle and present the ROTATED bearer — proof
+        // the same auth handle survives a transport restart.
+        let (_manager, stub, transport) = sse_transport_with_get(
+            SseGetGate {
+                denials: 1,
+                hits: AtomicUsize::new(0),
+            },
+            0,
+            vec![(
+                200,
+                serde_json::json!({"access_token": "at-2", "refresh_token": "rt-2", "token_type": "Bearer", "expires_in": 3600}),
+            )],
+        )
+        .await;
+        let lifecycle = crate::mcp_transport::McpRequestLifecycle::uncoordinated(0);
+        let err = send_sse(&transport, &lifecycle)
+            .await
+            .expect_err("a 401 stream attempt fails the connect");
+        assert!(err.to_string().contains("401"), "got: {err}");
+        async fn token_calls(stub: &Stub) -> usize {
+            stub.as_
+                .received_requests()
+                .await
+                .expect("received")
+                .iter()
+                .filter(|r| r.url.path() == "/token")
+                .count()
+        }
+        assert_eq!(
+            token_calls(&stub).await,
+            1,
+            "the stream 401 refreshed the grant for the next attempt"
+        );
+        // Reconnect: same transport object (same handle), new attempt.
+        let lifecycle = crate::mcp_transport::McpRequestLifecycle::uncoordinated(1);
+        let response = send_sse(&transport, &lifecycle)
+            .await
+            .expect("the next connect presents the rotated bearer");
+        assert_eq!(response.id, Some(serde_json::json!(7)));
+        assert_eq!(
+            token_calls(&stub).await,
+            1,
+            "the rotated grant is live: no second refresh"
+        );
+        let (gets, posts): (Vec<String>, Vec<String>) = {
+            let all = stub.mcp.received_requests().await.expect("received");
+            let get = |r: &wiremock::Request| {
+                r.headers
+                    .get("authorization")
+                    .map(|v| v.to_str().unwrap_or_default().to_string())
+                    .unwrap_or_default()
+            };
+            (
+                all.iter()
+                    .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/mcp")
+                    .map(get)
+                    .collect(),
+                all.iter()
+                    .filter(|r| r.method.as_str() == "POST")
+                    .map(get)
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            gets,
+            vec!["Bearer at-live".to_string(), "Bearer at-2".to_string()],
+            "connect #1 presented the live token, connect #2 the rotated one"
+        );
+        assert_eq!(
+            posts,
+            vec!["Bearer at-2".to_string()],
+            "the message POST on the restarted transport uses the rotated grant too"
         );
     }
 
