@@ -135,6 +135,153 @@ The value is applied when the MCP session starts; restart the affected session
 after changing it. Remove the field and restart the session to return to the
 default trust store. Stdio servers ignore it.
 
+## Remote server sign-in: OAuth (`oauth = true`)
+
+Remote (`http`/`sse`) servers that require login can authenticate through OAuth
+instead of a hand-managed `Authorization` header (config validation rejects
+setting both). Set `oauth = true` on the
+server; the transport then runs the authorization-code flow with PKCE (S256,
+`state`-bound) against whatever the server itself advertises. Nothing is
+hardcoded per provider: the protected-resource URL comes from the server's
+RFC 9728 `WWW-Authenticate` / well-known metadata, the authorization server
+endpoints from RFC 8414 metadata, and scopes are requested verbatim from
+`oauth_scopes`. Setting `oauth` (or its sub-fields) on a stdio server is
+rejected by config validation.
+
+First sign-in: ZeroClaw registers itself as a public PKCE client through RFC
+7591 dynamic registration when `oauth_client_id` is unset; if the server has
+no registration endpoint, set `oauth_client_id` to a client id you registered
+there by hand as a **public** (no-secret, PKCE) client with token-endpoint
+auth `none` (ZeroClaw never manages client secrets; the id is then used as-is
+and dynamic registration is skipped). It prints the authorization URL and also
+tries to open your browser; a failed browser launch is advisory only, the
+printed URL is the fallback by design. The callback is awaited on an
+ephemeral loopback port (`http://127.0.0.1:<port>/callback`, never a
+non-loopback listener), waiting up to 5 minutes. The callback must carry
+`state`; when the authorization server advertises RFC 9207 support, the
+response must also carry a matching `iss`. The exchanged grant is bound to the
+canonical resource URL (RFC 8707 `resource` is sent on every token request),
+so a token minted for one MCP server is never replayed at another.
+
+Sign-in only runs from an **interactive** ZeroClaw: a process with both stdin
+and stderr attached to a terminal. Any assembly running without an attached
+terminal (a detached daemon or service, and the gateway, channel, cron, eval,
+and ACP turns it runs headless) never prints a URL, never binds a callback
+port, and fails a first sign-in with an actionable "connect once from an
+interactive session" error instead. Note that `zeroclaw daemon` started in the
+foreground of a terminal is interactive by this rule: a sign-in triggered
+from one of its turns prints the URL and can hold that turn up to the 5-minute
+wait.
+
+Token lifecycle: tokens are refreshed proactively before expiry and once per
+401. On the `http` transport the request is then retried exactly once when
+the method is safe to replay (`initialize`, `tools/list`, resource/prompt
+reads); a `tools/call`, and every POST on the `sse` transport (the request is
+bound to stream bookkeeping there), is never replayed: the call fails as a
+plain HTTP 401 error while the refreshed grant applies to your next call, so
+a mutation cannot run twice. A refresh response that omits
+`refresh_token` keeps the stored one (RFC 6749 §6). A terminal `invalid_grant`
+clears the stored grant and asks for a new sign-in. If the authorization
+server behind a stored grant changes (discovered issuer no longer matches the
+issuer that minted it), ZeroClaw drops the grant rather than sending its
+tokens to the new server.
+
+Storage: grants (access token, optional ID token, refresh token, client id,
+issuer, returned scope) live in the encrypted auth-profile store beside your
+`config.toml`, keyed per MCP resource, and never appear in logs or errors. OAuth **refuses to run** without
+encrypted secret storage: with `secrets.encrypt = false` the manager fails
+closed with an actionable message instead of persisting plaintext refresh
+tokens. The requested `oauth_scopes` are sent verbatim; the scope string the
+AS returns is stored but not subset-checked, so the AS is the authority on
+what the token can do.
+
+Security posture (all enforced before any token leaves): MCP OAuth URLs must
+use `https` except on loopback; discovery and metadata documents are fetched
+with redirects disabled; DNS answers are validated (public addresses only,
+with metadata/link-local/multicast always rejected) and then pinned, closing
+the resolve-then-connect rebinding window; a private or loopback target is
+trusted only when its host equals the configured MCP host (the loopback
+spellings `localhost`, `127.0.0.1`, and `::1` count as one identity). A
+server-advertised SSE message endpoint must always share the configured MCP
+origin, and when OAuth is configured it must also be scheme-safe (https, or
+loopback plaintext), so a compromised server cannot move your session
+headers or bearer to another host and cannot downgrade an OAuth token in
+transit. The MCP bearer rides
+only to the configured origin; sign-in traffic itself goes to the discovered
+authorization server, which may legitimately be a different host. A runtime
+HTTP proxy that would capture MCP traffic fails the connection closed rather
+than routing it around the DNS pin. `oauth` is authentication only: it does
+not change
+`mcp_bundles`, tool risk profiles, `allowed_tools` / `excluded_tools`,
+`auto_approve`, or `always_ask`.
+
+### Example: Silpo (personal-account MCP server)
+
+```toml
+secrets.encrypt = true
+
+[[mcp.servers]]
+name = "silpo"
+transport = "http"
+url = "https://mcp.silpo.ua/mcp"
+oauth = true
+oauth_scopes = ["mcp:tools"]
+
+[mcp_bundles.groceries]
+servers = ["silpo"]
+
+[agents.assistant]
+mcp_bundles = ["groceries"]
+```
+
+**Warning:** this server fronts a personal grocery account. Its tools expose
+personal data (addresses, order history, bonuses) and can mutate real state
+(checkout, payment, cart). Those mutations remain fully subject to the normal
+MCP capability and approval policy above: OAuth authenticates the connection,
+it does not auto-approve anything. This configuration is documented, not
+tested against a live Silpo account: CI exercises the flow against local mock
+servers only, and the first live connection happens on your machine through
+the interactive sign-in above.
+
+### Trying the flow without a real server
+
+Any local OAuth-capable MCP server works as a smoke test, e.g. one served at
+`http://127.0.0.1:8000/mcp` (loopback is the one place plain `http` is
+allowed):
+
+```toml
+[[mcp.servers]]
+name = "localmock"
+transport = "http"
+url = "http://127.0.0.1:8000/mcp"
+oauth = true
+```
+
+Run an interactive `zeroclaw`: sign-in starts when the server's transport
+connects (the bearer is fetched before `initialize`), typically at session
+start; complete the browser step (or paste the printed URL) and confirm the
+tool list resolves. Expected failure shapes:
+no authorization URL printed and no browser opened → you are not in an
+interactive session (both stdin and stderr must be TTYs; piping stderr into
+a log disables sign-in); the callback
+never arrives → an AS configured with a different redirect URI, or a personal
+firewall blocking loopback listens (wait times out after 5 minutes);
+`invalid_client` → the AS rejects dynamic registration, register a public
+(no-secret) client by hand and set `oauth_client_id`; a later 401 loop or
+`invalid_grant` → the
+stored grant was revoked server-side; the grant is cleared and a fresh sign-in
+is requested automatically. Changing the AS URL behind a stored grant likewise
+signs the server out by design. To sign out manually, delete the server's
+`mcp:oauth@…` profile from `auth-profiles.json` in the config directory while
+ZeroClaw is stopped.
+
+Aliases of one URL share one grant: the stored grant is keyed by the
+canonical MCP resource URL, not by `name`, so running two `[[mcp.servers]]`
+entries with the same URL (different names, different bundles) does not
+create per-user isolation; the second sign-in replaces the first
+account's tokens. Use a separate ZeroClaw instance or config directory per
+person until explicit credential slots or per-principal credentials exist.
+
 ## Top-level fields
 
 {{#config-fields mcp}}
