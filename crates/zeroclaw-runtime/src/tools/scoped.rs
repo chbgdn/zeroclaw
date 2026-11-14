@@ -1059,7 +1059,21 @@ impl ScopedToolRegistry {
                         agent_mcp_servers.len(),
                         0,
                     );
-                    match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                    // Interactivity is decided by an attached terminal, not
+                    // by this call site (review S3-2): a CLI session may run
+                    // the browser sign-in here, while gateway/channel/eval/
+                    // ACP assemblies of the same code have no human at a
+                    // terminal and must get the fast background error. The
+                    // daemon worker paths pass false and never prompt.
+                    let interactive = tools::mcp_oauth_wiring::interactive_session();
+                    let oauth_manager = tools::mcp_oauth_wiring::shared_oauth_manager(config);
+                    match tools::McpRegistry::connect_all_with_oauth(
+                        &agent_mcp_servers,
+                        oauth_manager.as_ref(),
+                        interactive,
+                    )
+                    .await
+                    {
                         Ok(registry) => Some(Arc::new(registry)),
                         Err(err) => {
                             // Non-fatal (the assembly proceeds without MCP), but an ERROR

@@ -19,6 +19,7 @@ pub mod delegate;
 mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
+pub(crate) mod mcp_oauth_wiring;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
