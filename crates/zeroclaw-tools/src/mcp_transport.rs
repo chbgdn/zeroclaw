@@ -15,10 +15,30 @@ use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, oneshot};
 use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
 
+use crate::mcp_oauth::TransportOAuth;
 use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
 /// Maximum bytes for a single JSON-RPC response.
+/// MCP methods whose calls are read-only by protocol contract, so an OAuth
+/// 401 may be retried exactly once after a token refresh. Everything else
+/// (tools/call above all) is state-changing and NEVER auto-replayed: a 401
+/// there surfaces as an error with the grant refreshed for the next call.
+const OAUTH_SAFE_RETRY_METHODS: &[&str] = &[
+    "initialize",
+    "notifications/initialized",
+    "tools/list",
+    "resources/list",
+    "resources/templates/list",
+    "resources/read",
+    "prompts/list",
+    "prompts/get",
+];
+
+fn oauth_retry_is_safe(method: &str) -> bool {
+    OAUTH_SAFE_RETRY_METHODS.contains(&method)
+}
+
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 
 /// How often the stdio child-exit watcher polls the direct child process for
@@ -442,6 +462,20 @@ pub(crate) trait SharedMcpTransportConn: Send + Sync {
     /// Reset per-connection session state so the next operation re-establishes
     /// a fresh session. Default is a no-op for stateless transports (stdio).
     async fn reset(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Ensure the request credential is ready BEFORE any JSON-RPC I/O
+    /// timeout budget applies. OAuth-enabled transports use this to run
+    /// the interactive browser sign-in outside the handshake's receive
+    /// timeout: the sign-in wait is a human-paced loopback wait, not a
+    /// network receive, and must not be cut short by the 30s initialize
+    /// budget (a canceled wait drops the loopback listener mid-flow and
+    /// the browser callback then hits a dead port). The returned token is
+    /// intentionally not retained: the manager caches the live grant, so
+    /// the subsequent `send_and_recv` bearer lookup is an instant hit.
+    /// Default: no-op (non-OAuth and stdio transports).
+    async fn prepare_auth(&self) -> Result<()> {
         Ok(())
     }
 
@@ -1149,10 +1183,18 @@ pub struct HttpTransport {
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     session_id: ParkingMutex<Option<String>>,
+    /// Opt-in OAuth handle (see `crate::mcp_oauth`): bearer injection per
+    /// request and 401 handling. `None` keeps the pre-OAuth behavior
+    /// byte-for-byte.
+    oauth: Option<TransportOAuth>,
 }
 
 impl HttpTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
+        Self::new_with_oauth(config, None)
+    }
+
+    pub fn new_with_oauth(config: &McpServerConfig, oauth: Option<TransportOAuth>) -> Result<Self> {
         let url = config
             .url
             .as_ref()
@@ -1183,6 +1225,7 @@ impl HttpTransport {
             client,
             headers: config.headers.clone(),
             session_id: ParkingMutex::new(None),
+            oauth,
         })
     }
 
@@ -1224,6 +1267,13 @@ fn finish_response(
 
 #[async_trait::async_trait]
 impl SharedMcpTransportConn for HttpTransport {
+    async fn prepare_auth(&self) -> Result<()> {
+        if let Some(oauth) = &self.oauth {
+            oauth.bearer(None).await?;
+        }
+        Ok(())
+    }
+
     async fn send_and_recv(
         &self,
         request: &JsonRpcRequest,
@@ -1240,28 +1290,75 @@ impl SharedMcpTransportConn for HttpTransport {
             .keys()
             .any(|k| k.eq_ignore_ascii_case("Content-Type"));
 
-        let mut req = apply_request_timeout(
-            self.client.post(&self.url).body(body),
-            http_request_timeout_secs(request, self.tool_timeout_secs),
-        );
-        if !has_content_type {
-            req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
-        }
-        for (key, value) in &self.headers {
-            req = req.header(key, value);
-        }
-        if !has_accept {
-            req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
-        }
+        // A fresh `Authorization` value per attempt: first use (or near
+        // expiry) may trigger discovery/authorization/refresh, so it is
+        // fetched before the write gate opens, never inside it.
+        let mut oauth_bearer: Option<String> = None;
+        let mut oauth_retried = false;
+        let resp = 'oauth: loop {
+            let mut req = apply_request_timeout(
+                self.client.post(&self.url).body(body.clone()),
+                http_request_timeout_secs(request, self.tool_timeout_secs),
+            );
+            if !has_content_type {
+                req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
+            }
+            for (key, value) in &self.headers {
+                req = req.header(key, value);
+            }
+            if !has_accept {
+                req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
+            }
+            if let Some(oauth) = &self.oauth {
+                if oauth_bearer.is_none() {
+                    oauth_bearer = Some(oauth.bearer(None).await?);
+                }
+                req = req.header(
+                    reqwest::header::AUTHORIZATION,
+                    oauth_bearer.as_deref().unwrap_or_default(),
+                );
+            }
 
-        let epoch_guard = lifecycle.begin_write().await;
-        req = self.apply_session_header(req);
-        lifecycle.mark_outcome_unknown(epoch_guard.epoch());
-        let resp = req
-            .send()
-            .await
-            .context("HTTP request to MCP server failed")?;
-        drop(epoch_guard);
+            let epoch_guard = lifecycle.begin_write().await;
+            req = self.apply_session_header(req);
+            lifecycle.mark_outcome_unknown(epoch_guard.epoch());
+            let resp = req
+                .send()
+                .await
+                .context("HTTP request to MCP server failed")?;
+            drop(epoch_guard);
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(oauth) = &self.oauth
+            {
+                let used = oauth_bearer.take().unwrap_or_default();
+                let challenge = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                // A 401 proves this attempt completed: the server
+                // rejected the bearer before executing anything.
+                lifecycle.mark_completed();
+                if !oauth_retried && oauth_retry_is_safe(&request.method) {
+                    oauth_retried = true;
+                    oauth_bearer = Some(oauth.on_unauthorized(challenge.as_deref(), &used).await?);
+                    continue 'oauth;
+                }
+                // Not safe to replay (or already retried once): refresh
+                // the grant for FUTURE calls, surface this error to the
+                // caller. Two consecutive 401s are terminal.
+                if let Err(err) = oauth.on_unauthorized(challenge.as_deref(), &used).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"mcp_oauth": "401-refresh"})),
+                        &format!("MCP OAuth refresh after 401 failed: {err:#}")
+                    );
+                }
+            }
+            break resp;
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1360,6 +1457,8 @@ pub struct SseTransport {
     shared: std::sync::Arc<Mutex<SseSharedState>>,
     pending: SsePendingMap,
     notify: std::sync::Arc<Notify>,
+    /// Opt-in OAuth handle; semantics identical to [`HttpTransport::oauth`].
+    oauth: Option<TransportOAuth>,
 }
 
 struct SseConnState {
@@ -1370,6 +1469,10 @@ struct SseConnState {
 
 impl SseTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
+        Self::new_with_oauth(config, None)
+    }
+
+    pub fn new_with_oauth(config: &McpServerConfig, oauth: Option<TransportOAuth>) -> Result<Self> {
         let sse_url = config
             .url
             .as_ref()
@@ -1410,6 +1513,7 @@ impl SseTransport {
             shared: std::sync::Arc::new(Mutex::new(SseSharedState::default())),
             pending: Arc::new(ParkingMutex::new(HashMap::new())),
             notify: std::sync::Arc::new(Notify::new()),
+            oauth,
         })
     }
 
@@ -1440,8 +1544,43 @@ impl SseTransport {
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
         }
+        // The stream is long-lived and restartable, so its bearer is
+        // fetched fresh at every (re)start; a 401 here fails the connect
+        // (fail-open at the registry) after the grant was already refreshed
+        // for the next attempt.
+        let mut oauth_bearer: Option<String> = None;
+        if let Some(oauth) = &self.oauth {
+            oauth_bearer = Some(oauth.bearer(None).await?);
+            req = req.header(
+                reqwest::header::AUTHORIZATION,
+                oauth_bearer.as_deref().unwrap_or_default(),
+            );
+        }
 
         let resp = req.send().await.context("SSE GET to MCP server failed")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(oauth) = &self.oauth
+        {
+            let challenge = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            if let Err(err) = oauth
+                .on_unauthorized(
+                    challenge.as_deref(),
+                    oauth_bearer.as_deref().unwrap_or_default(),
+                )
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"mcp_oauth": "401-refresh-sse-get"})),
+                    &format!("MCP OAuth refresh after SSE stream 401 failed: {err:#}")
+                );
+            }
+        }
         if resp.status() == reqwest::StatusCode::NOT_FOUND
             || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
         {
@@ -1669,6 +1808,18 @@ impl SseTransport {
 struct SseSharedState {
     message_url: Option<String>,
     message_url_from_endpoint: bool,
+}
+
+#[cfg(test)]
+impl SseTransport {
+    /// Pre-seed the endpoint-event bookkeeping so cross-module tests can
+    /// exercise the advertised-endpoint origin gate deterministically,
+    /// without racing a live (or wiremock-EOF) stream reader.
+    pub(crate) async fn set_advertised_endpoint_for_test(&self, url: &str) {
+        let mut guard = self.shared.lock().await;
+        guard.message_url = Some(url.to_string());
+        guard.message_url_from_endpoint = true;
+    }
 }
 
 type SsePendingMap = Arc<ParkingMutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>;
@@ -1940,6 +2091,13 @@ async fn read_first_jsonrpc_from_sse_response(
 
 #[async_trait::async_trait]
 impl SharedMcpTransportConn for SseTransport {
+    async fn prepare_auth(&self) -> Result<()> {
+        if let Some(oauth) = &self.oauth {
+            oauth.bearer(None).await?;
+        }
+        Ok(())
+    }
+
     async fn send_and_recv(
         &self,
         request: &JsonRpcRequest,
@@ -1978,8 +2136,47 @@ impl SharedMcpTransportConn for SseTransport {
         // The message endpoint can be supplied by the server via the SSE
         // `endpoint` event, so re-check it here: a custom CA must never be
         // downgraded to plaintext by a server-controlled redirect target.
+        // This runs FIRST (reviewer A): its message ("requires an HTTPS SSE
+        // message endpoint") is the more specific diagnosis for the
+        // custom-CA shape, and both gates reject anyway.
         if self.require_https {
             require_https_url(&self.server_name, &message_url, "SSE message endpoint")?;
+        }
+
+        // An advertised message endpoint is untrusted server output: it may
+        // name another host entirely (`endpoint: https://evil.example/x`),
+        // and headers/bearer below would ride there. Same-origin equality is
+        // enforced for EVERY sse server (session headers are as exfiltratable
+        // as a bearer, and derived endpoints trivially pass — they are the
+        // configured URL itself). The additional https requirement applies
+        // only when OAuth is configured: a bearer must not ride plaintext,
+        // but pre-existing plain-http private-network servers without OAuth
+        // must keep working exactly as before.
+        if from_endpoint {
+            let configured = self
+                .sse_url
+                .parse::<reqwest::Url>()
+                .context("configured SSE URL is unparseable")?;
+            let advertised = message_url
+                .parse::<reqwest::Url>()
+                .with_context(|| "SSE server advertised an unparseable message endpoint")?;
+            crate::mcp_oauth::validate_advertised_message_endpoint(
+                &configured,
+                &advertised,
+                self.oauth.is_some(),
+            )?;
+        }
+
+        // Bearer fetched BEFORE the write permit is taken (review S3-3,
+        // mirroring the HTTP path): `bearer()` may hit the token endpoint
+        // (seconds) or run an interactive sign-in (minutes), and holding
+        // `epoch_guard` plus a registered response waiter across that stops
+        // every other request and recovery barrier on this transport.
+        // A 401 on the SSE POST is still NOT auto-replayed — the request is
+        // bound to the stream bookkeeping; the grant is rotated for the next.
+        let mut oauth_bearer: Option<String> = None;
+        if let Some(oauth) = &self.oauth {
+            oauth_bearer = Some(oauth.bearer(None).await?);
         }
 
         // Acquire the epoch permit before registering a response waiter.
@@ -2029,10 +2226,20 @@ impl SharedMcpTransportConn for SseTransport {
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
         }
+        if let Some(bearer) = oauth_bearer.as_deref() {
+            req = req.header(reqwest::header::AUTHORIZATION, bearer);
+        }
 
         lifecycle.mark_outcome_unknown(epoch_guard.epoch());
         let resp = req.send().await.context("SSE POST to MCP server failed")?;
         let status = resp.status();
+        // Capture before `resp` is consumed by a successful body read below;
+        // the 401 branch may need it after that move.
+        let www_authenticate = resp
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let mut got_direct = None;
 
         if status.is_success() {
@@ -2084,6 +2291,30 @@ impl SharedMcpTransportConn for SseTransport {
         }
 
         if !status.is_success() {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // A 401 is the one non-success that PROVES the attempt
+                // completed without executing the message: the bearer was
+                // rejected at the door. Every other non-success keeps the
+                // write outcome unknown (see
+                // `sse_post_404_is_not_replayed_to_derived_endpoint`), so
+                // recovery never blindly replays an ambiguous POST.
+                lifecycle.mark_completed();
+                if let Some(oauth) = &self.oauth
+                    && let Err(err) = oauth
+                        .on_unauthorized(
+                            www_authenticate.as_deref(),
+                            oauth_bearer.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"mcp_oauth": "401-refresh-sse-post"})),
+                        &format!("MCP OAuth refresh after SSE POST 401 failed: {err:#}")
+                    );
+                }
+            }
             if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
                 return Err(McpTransportError::StaleSession {
                     status: status.as_u16(),
@@ -2157,13 +2388,15 @@ pub fn create_transport(config: &McpServerConfig) -> Result<Box<dyn McpTransport
     }
 }
 
-pub(crate) fn create_shared_transport(
+pub(crate) fn create_shared_transport_with_oauth(
     config: &McpServerConfig,
+    oauth: Option<TransportOAuth>,
 ) -> Result<Box<dyn SharedMcpTransportConn>> {
     match config.transport {
+        // Stdio is a local child process: no HTTP surface to authorize.
         McpTransport::Stdio => Ok(Box::new(StdioTransport::new(config)?)),
-        McpTransport::Http => Ok(Box::new(HttpTransport::new(config)?)),
-        McpTransport::Sse => Ok(Box::new(SseTransport::new(config)?)),
+        McpTransport::Http => Ok(Box::new(HttpTransport::new_with_oauth(config, oauth)?)),
+        McpTransport::Sse => Ok(Box::new(SseTransport::new_with_oauth(config, oauth)?)),
     }
 }
 
@@ -2726,6 +2959,83 @@ mod tests {
         assert!(message.contains("internal"));
         assert!(message.contains("requires an HTTPS SSE message endpoint"));
         assert!(message.contains("refusing plaintext transport"));
+    }
+
+    #[tokio::test]
+    async fn non_oauth_plain_http_sse_accepts_same_origin_advertised_endpoint() {
+        // Review A1: a pre-existing plain-http private-network SSE server
+        // WITHOUT OAuth must keep working when the stream advertises its own
+        // origin — the https requirement applies only when a bearer rides.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"jsonrpc": "2.0", "id": 1, "result": {}}
+            )))
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "sse-plain-http".into(),
+            transport: McpTransport::Sse,
+            url: Some(format!("{}/sse", server.uri())),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).expect("build transport");
+        transport
+            .set_advertised_endpoint_for_test(&format!("{}/messages", server.uri()))
+            .await;
+        transport.conn.lock().await.stream_state = SseStreamState::Unsupported;
+
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let response = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect("plain-http same-origin advertised endpoint must work without OAuth");
+        assert_eq!(response.id, Some(serde_json::json!(1)));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("received")
+                .iter()
+                .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/messages")
+                .count(),
+            1,
+            "the message POST went to the advertised same-origin endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_oauth_sse_advertised_off_origin_is_rejected() {
+        // Without OAuth the https rule is gone, but same-origin equality
+        // remains: an advertised endpoint on another host/port would carry
+        // the session header off-box (port 9 is deliberately unlistened).
+        let server = wiremock::MockServer::start().await;
+        let config = McpServerConfig {
+            name: "sse-off-origin".into(),
+            transport: McpTransport::Sse,
+            url: Some(format!("{}/sse", server.uri())),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).expect("build transport");
+        transport
+            .set_advertised_endpoint_for_test("http://127.0.0.1:9/collect")
+            .await;
+        transport.conn.lock().await.stream_state = SseStreamState::Unsupported;
+
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("off-origin advertised endpoint is refused even without OAuth");
+        assert!(
+            err.to_string().contains("share the configured MCP origin"),
+            "got: {err}"
+        );
     }
 
     #[test]

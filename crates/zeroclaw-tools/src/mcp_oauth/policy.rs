@@ -107,8 +107,21 @@ pub fn ensure_oauth_url(url: &Url, what: &str) -> Result<()> {
 /// Reject a server-advertised SSE message endpoint that does not share the
 /// configured MCP URL's origin. The configured URL is trusted operator
 /// input; the advertised endpoint is not.
-pub fn validate_advertised_message_endpoint(configured: &Url, advertised: &Url) -> Result<()> {
-    ensure_oauth_url(advertised, "SSE message endpoint")?;
+///
+/// `enforce_https` carries the OAuth trust boundary only: with a bearer
+/// riding the POST, the advertised target must be https (or loopback).
+/// For NON-OAuth servers the same-origin equality below is the whole
+/// check — it already stops session-header exfiltration to another host,
+/// and requiring https there would break pre-existing plain-http
+/// private-network servers, which this branch promises to leave alone.
+pub fn validate_advertised_message_endpoint(
+    configured: &Url,
+    advertised: &Url,
+    enforce_https: bool,
+) -> Result<()> {
+    if enforce_https {
+        ensure_oauth_url(advertised, "SSE message endpoint")?;
+    }
     if origin_key(configured)? != origin_key(advertised)? {
         bail!(
             "advertised SSE message endpoint must share the configured MCP origin, got {} for {}",
@@ -481,17 +494,53 @@ mod tests {
         validate_advertised_message_endpoint(
             &configured,
             &url("https://mcp.example.com/sse/messages"),
+            true,
         )
         .expect("same origin ok");
         validate_advertised_message_endpoint(
             &configured,
             &url("https://evil.example.com/messages"),
+            true,
         )
         .expect_err("cross-origin rejected");
-        validate_advertised_message_endpoint(&configured, &url("http://mcp.example.com/messages"))
-            .expect_err("downgrade rejected");
-        validate_advertised_message_endpoint(&configured, &url("https://mcp.example.com:8443/msg"))
-            .expect_err("port change rejected");
+        validate_advertised_message_endpoint(
+            &configured,
+            &url("http://mcp.example.com/messages"),
+            true,
+        )
+        .expect_err("downgrade rejected when a bearer rides");
+        validate_advertised_message_endpoint(
+            &configured,
+            &url("https://mcp.example.com:8443/msg"),
+            true,
+        )
+        .expect_err("port change rejected");
+    }
+
+    #[test]
+    fn non_oauth_advertised_endpoint_needs_only_same_origin() {
+        // A plain-http private-network server must keep working (the PR
+        // promises static-header MCP is unchanged); same-origin equality
+        // still closes the session-header exfiltration hole.
+        let configured = url("http://192.168.1.10:8080/sse");
+        validate_advertised_message_endpoint(
+            &configured,
+            &url("http://192.168.1.10:8080/messages"),
+            false,
+        )
+        .expect("plain http same-origin ok without OAuth");
+        validate_advertised_message_endpoint(
+            &configured,
+            &url("http://192.168.1.11:8080/messages"),
+            false,
+        )
+        .expect_err("cross-host still rejected");
+        validate_advertised_message_endpoint(
+            &configured,
+            &url("http://192.168.1.10:9090/messages"),
+            false,
+        )
+        .expect_err("port change still rejected");
     }
 
     #[test]
