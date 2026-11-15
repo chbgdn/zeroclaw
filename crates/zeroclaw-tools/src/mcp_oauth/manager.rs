@@ -21,14 +21,18 @@ use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use reqwest::Url;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use zeroclaw_config::schema::McpServerConfig;
 
 use super::browser::{BrowserLauncher, SystemBrowserLauncher};
 use super::discovery::{OAuthDiscovery, discover_oauth};
-use super::listener::{CALLBACK_WAIT_TIMEOUT, CallbackFlow, LoopbackListener};
+use super::listener::{
+    CALLBACK_WAIT_TIMEOUT, CallbackFlow, CallbackVerdict, LoopbackListener, classify_callback_url,
+};
 use super::pkce::{Pkce, new_state};
 use super::policy::OAuthClientFactory;
 use super::refresh::RefreshCoordinator;
@@ -347,6 +351,11 @@ pub struct McpOAuthManager {
     /// resolved from its source, not snapshotted into long-lived handles
     /// (AGENTS.md).
     nat64_prefixes: Arc<std::sync::Mutex<Vec<zeroclaw_infra::net_guard::Nat64Prefix>>>,
+    /// One-shot paste feed consumed by the next `authorize` (see
+    /// [`McpOAuthManager::paste_feed`]); `None` means the stdin fallback
+    /// arms only for the explicit admin sign-in (`allow_stdin_paste`) and
+    /// only when stdin is a terminal - agent turns never read stdin.
+    paste_rx: Mutex<Option<mpsc::Receiver<String>>>,
 }
 
 impl std::fmt::Debug for McpOAuthManager {
@@ -408,7 +417,18 @@ impl McpOAuthManager {
             states: Mutex::new(HashMap::new()),
             refresh: RefreshCoordinator::new(),
             nat64_prefixes: Arc::new(std::sync::Mutex::new(nat64_prefixes)),
+            paste_rx: Mutex::new(None),
         })
+    }
+
+    /// Test/embedder seam: route pasted redirect URLs into the next
+    /// `authorize` from memory instead of process stdin (design §13.1).
+    /// One-shot: the first authorize takes the receiver; lines sent after
+    /// it closes are simply dropped.
+    pub fn paste_feed(&self) -> mpsc::Sender<String> {
+        let (tx, rx) = mpsc::channel(8);
+        *self.paste_rx.lock() = Some(rx);
+        tx
     }
 
     fn state_for(&self, config: &McpServerConfig) -> Result<Arc<ServerState>> {
@@ -737,7 +757,7 @@ impl McpOAuthManager {
                 if let Some(grant) = state.grant.read().await.as_ref() {
                     return Ok(bearer_header_value(&grant.tokens.access_token));
                 }
-                self.authorize(&state, interactive).await
+                self.authorize(&state, interactive, false).await
             })
             .await
     }
@@ -960,7 +980,9 @@ impl McpOAuthManager {
                 };
                 match next {
                     Next::Rotated(bearer) => Forced::Resolved(Ok(bearer)),
-                    Next::Signin => Forced::Resolved(self.authorize(&state, interactive).await),
+                    Next::Signin => {
+                        Forced::Resolved(self.authorize(&state, interactive, false).await)
+                    }
                     Next::Refresh(refresh_token, client_id, discovery) => {
                         let discovery =
                             match discovery.context("OAuth discovery vanished unexpectedly") {
@@ -1223,7 +1245,7 @@ impl McpOAuthManager {
                         if !interactive {
                             return Err(err);
                         }
-                        let bearer = self.authorize(&state, true).await?;
+                        let bearer = self.authorize(&state, true, false).await?;
                         Ok(bearer)
                     })
                     .await;
@@ -1425,7 +1447,7 @@ impl McpOAuthManager {
         dead_access: &str,
     ) -> Result<String> {
         McpOAuthManager::clear_spent_grant(&self.store, state, dead_access).await;
-        self.authorize(state, interactive).await
+        self.authorize(state, interactive, false).await
     }
 
     /// Commit a successful refresh exactly one way (shared by the forced
@@ -1864,10 +1886,27 @@ impl McpOAuthManager {
         }
     }
 
+    /// The paste-path decision, factored out so the matrix is pinned by a
+    /// unit test without faking a terminal: an injected feed is always
+    /// live (it owns no stdin); process stdin is read only for the
+    /// explicit admin command AND only when it is a terminal.
+    fn stdin_paste_path(
+        allow_stdin_paste: bool,
+        feed_present: bool,
+        stdin_is_terminal: bool,
+    ) -> bool {
+        feed_present || (allow_stdin_paste && stdin_is_terminal)
+    }
+
     /// The authorization half: browser flow in interactive mode, actionable
     /// error in background mode. Caller must hold no transport locks here —
     /// this can take minutes.
-    async fn authorize(&self, state: &Arc<ServerState>, interactive: bool) -> Result<String> {
+    async fn authorize(
+        &self,
+        state: &Arc<ServerState>,
+        interactive: bool,
+        allow_stdin_paste: bool,
+    ) -> Result<String> {
         // One policy snapshot for the whole sign-in: scopes, client id and
         // the registration request must be built from the SAME config view.
         let policy = state.policy();
@@ -1978,16 +2017,99 @@ impl McpOAuthManager {
             require_iss: discovery.auth_server.require_iss,
             pkce: pkce.clone(),
         };
-        let code = tokio::time::timeout(
-            CALLBACK_WAIT_TIMEOUT + Duration::from_secs(5),
-            listener.wait_for_code(&flow, CALLBACK_WAIT_TIMEOUT),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::Error::msg(
-                "MCP OAuth browser sign-in did not complete before the outer deadline",
-            )
-        })??;
+
+        // Manual-paste fallback (design §13.1): an operator whose browser
+        // cannot reach this machine's loopback port (ZeroClaw in a
+        // container, browser elsewhere, tunnel rewrites) pastes the final
+        // address-bar URL instead. The verdict uses `classify_callback_url`
+        // - the listener's own rules, same order, same everything: the
+        // pasted text carries no more authority than a socket callback
+        // would have. The token exchange below keeps posting the ORIGINAL
+        // `redirect_uri` the code was minted with (RFC 6749 §4.1.3), so a
+        // host:port rewrite in the paste is irrelevant.
+        //
+        // The PROCESS-STDIN paste path is deliberately confined to the
+        // explicit admin command (`allow_stdin_paste`: `zeroclaw mcp
+        // signin`, whose process exits when the flow ends). Agent-turn
+        // sign-ins must not spawn the stdin reader: it blocks inside a
+        // read holding the process-wide stdin lock, and once the flow
+        // completes by callback it would consume - and discard - the
+        // operator's NEXT typed line, which in the REPL is their first
+        // message to the agent, not a stray Enter. The injected feed
+        // (`paste_feed`) owns no stdin and stays available to every
+        // caller (tests, embedders).
+        let paste_rx = self.paste_rx.lock().take();
+        let paste_active = Self::stdin_paste_path(
+            allow_stdin_paste,
+            paste_rx.is_some(),
+            std::io::stdin().is_terminal(),
+        );
+        if paste_active {
+            eprintln!(
+                "MCP OAuth: if the browser cannot reach this machine, paste its final URL here and press Enter."
+            );
+        }
+        let paste_wait = {
+            let flow = flow.clone();
+            async move {
+                let mut rx = match paste_rx {
+                    Some(rx) => rx,
+                    None => {
+                        if !paste_active {
+                            // No paste path here: never swallow piped
+                            // stdin, never busy-loop; the browser wait
+                            // decides alone.
+                            return std::future::pending::<Result<String>>().await;
+                        }
+                        let (tx, rx) = mpsc::channel(8);
+                        super::paste::spawn_stdin_reader(tx);
+                        rx
+                    }
+                };
+                while let Some(line) = rx.recv().await {
+                    let candidate = line.trim().trim_matches('"').trim_matches('\'');
+                    if candidate.is_empty() {
+                        continue;
+                    }
+                    let Ok(url) = Url::parse(candidate) else {
+                        eprintln!(
+                            "MCP OAuth: that paste is not a full URL; still waiting for the sign-in."
+                        );
+                        continue;
+                    };
+                    match classify_callback_url(&url, &flow) {
+                        CallbackVerdict::Code(code) => return Ok(code),
+                        CallbackVerdict::IdpError(err) => {
+                            // Same wording the listener uses for the same
+                            // verdict, so operators see one error shape.
+                            bail!("the identity provider denied the sign-in: {err}")
+                        }
+                        CallbackVerdict::IssuerMismatch(err) => bail!("{err}"),
+                        CallbackVerdict::NotVerdict => {
+                            eprintln!(
+                                "MCP OAuth: pasted URL does not match this sign-in (state, path, or no code); still waiting."
+                            );
+                        }
+                    }
+                }
+                // Paste source exhausted (stdin closed): stay silent and
+                // let the browser wait be the only remaining verdict.
+                std::future::pending::<Result<String>>().await
+            }
+        };
+        let code =
+            tokio::time::timeout(CALLBACK_WAIT_TIMEOUT + Duration::from_secs(5), async move {
+                tokio::select! {
+                    listened = listener.wait_for_code(&flow, CALLBACK_WAIT_TIMEOUT) => listened,
+                    pasted = paste_wait => pasted,
+                }
+            })
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(
+                    "MCP OAuth browser sign-in did not complete before the outer deadline",
+                )
+            })??;
 
         let token_client = policy
             .factory
@@ -3373,6 +3495,248 @@ mod tests {
         fn launch(&self, _url: &Url) -> Result<()> {
             anyhow::bail!("never")
         }
+    }
+
+    #[test]
+    fn stdin_paste_path_matrix() {
+        // The decision `authorize` actually makes, pinned without faking a
+        // terminal: an injected feed is always live; process stdin is read
+        // ONLY for the admin sign-in (`force_signin` passes
+        // `allow_stdin_paste = true`; every agent-turn path passes false)
+        // and only when stdin is really a terminal.
+        assert!(McpOAuthManager::stdin_paste_path(false, true, false));
+        assert!(McpOAuthManager::stdin_paste_path(true, true, true));
+        assert!(McpOAuthManager::stdin_paste_path(true, false, true));
+        assert!(
+            !McpOAuthManager::stdin_paste_path(false, false, true),
+            "agent turn on a TTY must not start the stdin reader"
+        );
+        assert!(
+            !McpOAuthManager::stdin_paste_path(true, false, false),
+            "admin sign-in without a terminal must not start the reader"
+        );
+        assert!(!McpOAuthManager::stdin_paste_path(false, false, false));
+    }
+
+    /// The container story end to end: the browser never reaches the
+    /// listener (it lives on another machine), so the final URLs arrive on
+    /// the paste channel instead, with `host:port` rewritten by whatever
+    /// tunnel the operator used. Each line template may mention `{state}`
+    /// and `{redirect}`, taken from the real authorization URL.
+    struct PastingLauncher {
+        lines: &'static [&'static str],
+        paste: std::sync::Mutex<Option<mpsc::Sender<String>>>,
+        redirect: std::sync::Mutex<Option<String>>,
+    }
+
+    impl PastingLauncher {
+        fn new(lines: &'static [&'static str]) -> Arc<Self> {
+            Arc::new(Self {
+                lines,
+                paste: std::sync::Mutex::new(None),
+                redirect: std::sync::Mutex::new(None),
+            })
+        }
+        fn with_feed(self: &Arc<Self>, tx: mpsc::Sender<String>) {
+            *self.paste.lock().expect("lock") = Some(tx);
+        }
+        fn seen_redirect(&self) -> Option<String> {
+            self.redirect.lock().expect("lock").clone()
+        }
+    }
+
+    impl BrowserLauncher for PastingLauncher {
+        fn launch(&self, url: &Url) -> Result<()> {
+            let state = url
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .map(|(_, v)| v.into_owned())
+                .expect("state");
+            let redirect = url
+                .query_pairs()
+                .find(|(k, _)| k == "redirect_uri")
+                .map(|(_, v)| v.into_owned())
+                .expect("redirect_uri");
+            *self.redirect.lock().expect("lock") = Some(redirect.clone());
+            let tx = self
+                .paste
+                .lock()
+                .expect("lock")
+                .clone()
+                .expect("paste feed must be installed before the flow starts");
+            // Send off-thread: `launch` runs on a runtime worker (blocking
+            // sends would panic there), and a real operator types the
+            // paste long after the browser opened anyway.
+            let lines: Vec<String> = self
+                .lines
+                .iter()
+                .map(|t| {
+                    t.replace("{state}", &state)
+                        .replace("{redirect}", &redirect)
+                })
+                .collect();
+            std::thread::spawn(move || {
+                for line in lines {
+                    if tx.blocking_send(line).is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(())
+        }
+    }
+
+    fn paste_stub_tokens() -> Vec<(u16, serde_json::Value)> {
+        vec![(
+            200,
+            serde_json::json!({"access_token": "at-paste", "expires_in": 3600, "token_type": "Bearer"}),
+        )]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pasted_redirect_with_rewritten_host_completes_the_flow() {
+        // Design §13.1: an address-bar URL whose host:port the tunnel
+        // rewrote completes the sign-in, and the token exchange still
+        // posts the ORIGINAL bound redirect_uri (RFC 6749 §4.1.3), never
+        // the rewrite.
+        let stub = stub(
+            Some(serde_json::json!({"client_id": "dyn-cid"})),
+            paste_stub_tokens(),
+        )
+        .await;
+        let launcher =
+            PastingLauncher::new(&["http://localhost:9999/callback?code=pasted-1&state={state}"]);
+        let manager = manager_with(&stub, launcher.clone());
+        launcher.with_feed(manager.paste_feed());
+        let bearer = manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect("pasted sign-in");
+        assert_eq!(bearer, "Bearer at-paste");
+
+        let original = launcher
+            .seen_redirect()
+            .expect("launcher saw the authorize URL");
+        assert!(
+            original.starts_with("http://127.0.0.1:"),
+            "the bound redirect was: {original}"
+        );
+        let requests = stub.as_.received_requests().await.expect("received");
+        let token_body = requests
+            .iter()
+            .find(|r| r.url.path() == "/token")
+            .map(|r| String::from_utf8(r.body.clone()).expect("utf8"))
+            .expect("token POST");
+        assert!(token_body.contains("code=pasted-1"));
+        assert!(
+            token_body.contains(&format!("redirect_uri={}", urlencoded(&original))),
+            "the exchange must post the original bound redirect_uri, got: {token_body}"
+        );
+        assert!(
+            !token_body.contains("localhost%3A9999"),
+            "the pasted host:port rewrite must not leak into the exchange"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pasted_garbage_and_foreign_state_rearm_then_the_real_paste_wins() {
+        // A mis-paste must not end the flow: it is reported and the
+        // listener keeps waiting, exactly like a foreign socket request.
+        let stub = stub(
+            Some(serde_json::json!({"client_id": "dyn-cid"})),
+            paste_stub_tokens(),
+        )
+        .await;
+        let launcher = PastingLauncher::new(&[
+            "this is not a url",
+            "http://localhost:9999/callback?code=nope&state=foreign-state",
+            "http://localhost:9999/callback?code=yes&state={state}",
+        ]);
+        let manager = manager_with(&stub, launcher.clone());
+        launcher.with_feed(manager.paste_feed());
+        let bearer = manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect("sign-in survives mis-pastes");
+        assert_eq!(bearer, "Bearer at-paste");
+        let requests = stub.as_.received_requests().await.expect("received");
+        let token_body = requests
+            .iter()
+            .find(|r| r.url.path() == "/token")
+            .map(|r| String::from_utf8(r.body.clone()).expect("utf8"))
+            .expect("token POST");
+        assert!(
+            token_body.contains("code=yes") && !token_body.contains("code=nope"),
+            "only the matching paste may be exchanged: {token_body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pasted_idp_error_fails_the_flow_like_the_listener_would() {
+        let stub = stub(
+            Some(serde_json::json!({"client_id": "dyn-cid"})),
+            paste_stub_tokens(),
+        )
+        .await;
+        let launcher = PastingLauncher::new(&[
+            "http://localhost:9999/callback?error=access_denied&error_description=nope&state={state}",
+        ]);
+        let manager = manager_with(&stub, launcher.clone());
+        launcher.with_feed(manager.paste_feed());
+        let err = manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect_err("a pasted denial is a flow failure");
+        assert!(
+            err.to_string().contains("access_denied (nope)"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pasted_issuer_mismatch_fails_the_flow() {
+        let stub = stub(
+            Some(serde_json::json!({"client_id": "dyn-cid"})),
+            paste_stub_tokens(),
+        )
+        .await;
+        let launcher = PastingLauncher::new(&[
+            "http://localhost:9999/callback?code=c&iss=https://evil.example&state={state}",
+        ]);
+        let manager = manager_with(&stub, launcher.clone());
+        launcher.with_feed(manager.paste_feed());
+        let err = manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect_err("a pasted mixed-up issuer is a flow failure");
+        assert!(err.to_string().contains("issuer"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closed_paste_feed_leaves_the_browser_callback_in_charge() {
+        // An exhausted paste source (stdin closed / feed dropped) must
+        // neither fail the flow nor busy-loop: the browser callback
+        // remains the sole verdict, exactly as before this feature.
+        let stub = stub(Some(serde_json::json!({"client_id": "dyn-cid"})), vec![(
+            200,
+            serde_json::json!({"access_token": "at-1", "expires_in": 3600, "token_type": "Bearer"}),
+        )])
+        .await;
+        let manager = manager_with(
+            &stub,
+            Arc::new(AutoCallbackLauncher {
+                code: "via-browser",
+                fail: false,
+                launches: AtomicUsize::new(0),
+            }),
+        );
+        let tx = manager.paste_feed();
+        drop(tx);
+        let bearer = manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect("browser callback still completes the flow");
+        assert_eq!(bearer, "Bearer at-1");
     }
 
     fn urlencoded(s: &str) -> String {
