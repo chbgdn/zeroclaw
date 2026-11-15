@@ -302,6 +302,21 @@ impl McpTokenStore {
                 )
             })
     }
+    /// Remove `canonical`'s stored grant whoever holds it. This is the
+    /// operator-intent removal (`zeroclaw mcp signout`): unlike
+    /// [`Self::clear_if_access_matches`] it promises nothing about which
+    /// credential was disproved, it carries the request that this sign-in
+    /// should stop existing, so it removes the row unconditionally and
+    /// reports whether a grant was there to remove.
+    pub async fn remove_authorization(&self, canonical: &CanonicalResource) -> Result<bool> {
+        let id = profile_id(MCP_MODEL_PROVIDER, &profile_name_for(canonical));
+        self.store.remove_profile(&id).await.with_context(|| {
+            format!(
+                "cannot remove the MCP OAuth grant for {}",
+                canonical.resource()
+            )
+        })
+    }
 }
 
 #[cfg(test)]

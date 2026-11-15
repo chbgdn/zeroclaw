@@ -46,7 +46,7 @@ pub use browser::{BrowserLauncher, SystemBrowserLauncher};
 pub use challenge::{BearerChallenge, parse_bearer_challenge};
 pub use discovery::{OAuthDiscovery, discover_oauth};
 pub use listener::{CALLBACK_WAIT_TIMEOUT, CallbackFlow, LoopbackListener};
-pub use manager::{McpOAuthManager, TransportOAuth};
+pub use manager::{GrantSummary, McpOAuthManager, TransportOAuth};
 pub use metadata::{AuthorizationServerMetadata, ProtectedResourceMetadata, ValidatedAs};
 pub use pkce::Pkce;
 pub use policy::{
