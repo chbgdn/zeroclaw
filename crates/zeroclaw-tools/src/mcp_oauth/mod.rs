@@ -32,6 +32,7 @@ pub mod discovery;
 pub mod listener;
 pub mod manager;
 pub mod metadata;
+mod paste;
 pub mod pkce;
 pub mod policy;
 pub mod refresh;

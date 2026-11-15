@@ -190,9 +190,20 @@ printed URL is the fallback by design. The callback is awaited on an
 ephemeral loopback port (`http://127.0.0.1:<port>/callback`, never a
 non-loopback listener), waiting up to 5 minutes. The callback must carry
 `state`; when the authorization server advertises RFC 9207 support, the
-response must also carry a matching `iss`. The exchanged grant is bound to the
-canonical resource URL (RFC 8707 `resource` is sent on every token request),
-so a token minted for one MCP server is never replayed at another.
+response must also carry a matching `iss`. If the browser runs somewhere
+it cannot reach that port on this machine (ZeroClaw in a container, a
+remote host, an SSH tunnel that rewrote the address), start the sign-in
+as `zeroclaw mcp signin <server>` (see the pre-authorization note below):
+its terminal also accepts the browser's final redirect URL pasted back.
+Pasted URLs are judged by the same `state` and issuer rules as the
+socket callback, and the token exchange always posts the original
+`redirect_uri`, so the rewrite does not matter. A sign-in that starts
+during an agent turn stays browser + listener only, because that process
+needs the terminal for the conversation; use the explicit command for
+unreachable-port topologies. The exchanged grant is bound to
+the canonical resource URL (RFC 8707 `resource` is sent on every token
+request), so a token minted for one MCP server is never replayed at
+another.
 
 Sign-in only runs from an **interactive** ZeroClaw. The entry point that
 owns the human must declare the posture: the foreground `zeroclaw` run does,

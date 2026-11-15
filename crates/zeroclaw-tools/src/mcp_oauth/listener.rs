@@ -8,6 +8,7 @@
 //! carries this flow's state, and shut down.
 
 use anyhow::{Context, Result, bail};
+use reqwest::Url;
 use std::time::Duration;
 
 use super::pkce::Pkce;
@@ -89,11 +90,87 @@ impl CallbackFlow {
     }
 }
 
-enum CallbackParse {
+/// How a candidate callback URL reads against a specific flow. Shared by
+/// the listener (raw request target) and the paste fallback (pasted
+/// address-bar URL) so both paths apply identical rules in identical
+/// order — the whole safety of the paste path rests on that: the pasted
+/// text never gets more authority than a socket callback would have had.
+#[derive(Debug)]
+pub(crate) enum CallbackVerdict {
+    /// A `code` carrying this flow's `state` (and a conforming `iss`).
     Code(String),
+    /// This flow, but the IdP denied the sign-in (`error` parameter).
     IdpError(String),
+    /// This flow's state, but an RFC 9207 issuer violation.
     IssuerMismatch(String),
-    Ignore,
+    /// Not a verdict for this flow: foreign/missing state, wrong path,
+    /// duplicate parameters, or neither `code` nor `error`. The listener
+    /// skips such requests; the paste path reports and re-arms.
+    NotVerdict,
+}
+
+/// Classify one callback candidate against `flow`. Scheme, host and port
+/// carry NO meaning for the verdict: the loopback redirect's identity is
+/// the one-shot `state` (plus `iss` when advertised), which is exactly why
+/// a tunnel that rewrote `host:port` in the browser bar still classifies
+/// the same callback as the direct hit.
+pub(crate) fn classify_callback_url(url: &Url, flow: &CallbackFlow) -> CallbackVerdict {
+    if url.path() != "/callback" {
+        return CallbackVerdict::NotVerdict;
+    }
+    let mut state = None;
+    let mut code = None;
+    let mut error = None;
+    let mut error_description = None;
+    let mut iss = None;
+    let mut duplicate_key = false;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "state" => {
+                duplicate_key |= state.is_some();
+                state = Some(value.into_owned());
+            }
+            "code" => {
+                duplicate_key |= code.is_some();
+                code = Some(value.into_owned());
+            }
+            "error" => {
+                duplicate_key |= error.is_some();
+                error = Some(value.into_owned());
+            }
+            "error_description" => error_description = Some(value.into_owned()),
+            "iss" => {
+                duplicate_key |= iss.is_some();
+                iss = Some(value.into_owned());
+            }
+            _ => {}
+        }
+    }
+    if duplicate_key {
+        // RFC 6749 forbids repeating these parameters; last-wins would
+        // let one copy hide another's value, so refuse to act on it.
+        return CallbackVerdict::NotVerdict;
+    }
+    // State gates everything: an error without this flow's state is some
+    // other request's business, not a verdict on this flow.
+    if state.as_deref() != Some(flow.state.as_str()) {
+        return CallbackVerdict::NotVerdict;
+    }
+    // The issuer check precedes both the error and the code: a mixed-up
+    // response is not acted on either way.
+    if let Err(e) = flow.check_callback_issuer(iss.as_deref()) {
+        return CallbackVerdict::IssuerMismatch(e.to_string());
+    }
+    if let Some(err) = error {
+        let detail = error_description
+            .map(|d| format!(" ({})", super::truncate_untrusted(&d)))
+            .unwrap_or_default();
+        return CallbackVerdict::IdpError(format!("{}{detail}", super::truncate_untrusted(&err)));
+    }
+    match code {
+        Some(code) => CallbackVerdict::Code(code),
+        None => CallbackVerdict::NotVerdict,
+    }
 }
 
 /// The one-shot loopback callback listener (RFC 8252). Requests that do not
@@ -167,19 +244,19 @@ impl LoopbackListener {
                 Ok(Err(_)) => continue,
             };
             match Self::parse_callback(&target, flow) {
-                CallbackParse::Code(code) => {
+                CallbackVerdict::Code(code) => {
                     Self::respond(&mut stream, 200, SUCCESS_PAGE).await;
                     return Ok(code);
                 }
-                CallbackParse::IdpError(err) => {
+                CallbackVerdict::IdpError(err) => {
                     Self::respond(&mut stream, 200, FAILURE_PAGE).await;
                     bail!("the identity provider denied the sign-in: {err}");
                 }
-                CallbackParse::IssuerMismatch(err) => {
+                CallbackVerdict::IssuerMismatch(err) => {
                     Self::respond(&mut stream, 400, FAILURE_PAGE).await;
                     bail!("{err}");
                 }
-                CallbackParse::Ignore => {
+                CallbackVerdict::NotVerdict => {
                     Self::respond(&mut stream, 404, FAILURE_PAGE).await;
                 }
             }
@@ -209,66 +286,14 @@ impl LoopbackListener {
         Ok(parts.next().unwrap_or_default().to_string())
     }
 
-    fn parse_callback(target: &str, flow: &CallbackFlow) -> CallbackParse {
-        let Ok(url) = reqwest::Url::parse(&format!("http://127.0.0.1{target}")) else {
-            return CallbackParse::Ignore;
+    fn parse_callback(target: &str, flow: &CallbackFlow) -> CallbackVerdict {
+        // The request target is origin-relative by protocol; framing it on
+        // the loopback origin is a parse aid only, since host/scheme carry
+        // no verdict meaning (see `classify_callback_url`).
+        let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
+            return CallbackVerdict::NotVerdict;
         };
-        if url.path() != "/callback" {
-            return CallbackParse::Ignore;
-        }
-        let mut state = None;
-        let mut code = None;
-        let mut error = None;
-        let mut error_description = None;
-        let mut iss = None;
-        let mut duplicate_key = false;
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "state" => {
-                    duplicate_key |= state.is_some();
-                    state = Some(value.into_owned());
-                }
-                "code" => {
-                    duplicate_key |= code.is_some();
-                    code = Some(value.into_owned());
-                }
-                "error" => {
-                    duplicate_key |= error.is_some();
-                    error = Some(value.into_owned());
-                }
-                "error_description" => error_description = Some(value.into_owned()),
-                "iss" => {
-                    duplicate_key |= iss.is_some();
-                    iss = Some(value.into_owned());
-                }
-                _ => {}
-            }
-        }
-        if duplicate_key {
-            // RFC 6749 forbids repeating these parameters; last-wins would
-            // let one copy hide another's value, so refuse to act on it.
-            return CallbackParse::Ignore;
-        }
-        // State gates everything: an error without this flow's state is some
-        // other request's business, not a verdict on this flow.
-        if state.as_deref() != Some(flow.state.as_str()) {
-            return CallbackParse::Ignore;
-        }
-        // The issuer check precedes both the error and the code: a mixed-up
-        // response is not acted on either way.
-        if let Err(e) = flow.check_callback_issuer(iss.as_deref()) {
-            return CallbackParse::IssuerMismatch(e.to_string());
-        }
-        if let Some(err) = error {
-            let detail = error_description
-                .map(|d| format!(" ({})", super::truncate_untrusted(&d)))
-                .unwrap_or_default();
-            return CallbackParse::IdpError(format!("{}{detail}", super::truncate_untrusted(&err)));
-        }
-        match code {
-            Some(code) => CallbackParse::Code(code),
-            None => CallbackParse::Ignore,
-        }
+        classify_callback_url(&url, flow)
     }
 
     async fn respond(stream: &mut tokio::net::TcpStream, status: u16, body: &str) {
@@ -299,6 +324,53 @@ mod tests {
             require_iss: false,
             pkce: Pkce::from_verifier("verifier"),
         }
+    }
+
+    #[test]
+    fn classify_pasted_url_judges_state_not_host() {
+        // The paste fallback's core claim: verdicts depend on the flow's
+        // one-shot state (plus iss/code/error rules), never on scheme or
+        // host or port, so a tunnel that rewrote the address bar still
+        // classifies the same callback - and nothing else changes.
+        let f = flow("s1");
+        for raw in [
+            "http://localhost:9999/callback?code=c&state=s1",
+            "https://some.tunnel.example:8443/callback?code=c&state=s1",
+        ] {
+            let url = Url::parse(raw).expect("url");
+            assert!(
+                matches!(classify_callback_url(&url, &f), CallbackVerdict::Code(c) if c == "c"),
+                "{raw} must classify as the flow's code"
+            );
+        }
+        // Everything else keeps the listener's exact rules.
+        let url = Url::parse("http://localhost:9999/collect?code=c&state=s1").expect("url");
+        assert!(matches!(
+            classify_callback_url(&url, &f),
+            CallbackVerdict::NotVerdict
+        ));
+        let url = Url::parse("http://localhost:9999/callback?code=a&code=b&state=s1").expect("url");
+        assert!(matches!(
+            classify_callback_url(&url, &f),
+            CallbackVerdict::NotVerdict
+        ));
+        let url = Url::parse("http://localhost:9999/callback?code=c&state=other").expect("url");
+        assert!(matches!(
+            classify_callback_url(&url, &f),
+            CallbackVerdict::NotVerdict
+        ));
+        let url = Url::parse("http://localhost:9999/callback?iss=https://evil.example&state=s1")
+            .expect("url");
+        assert!(matches!(
+            classify_callback_url(&url, &f),
+            CallbackVerdict::IssuerMismatch(_)
+        ));
+        let url =
+            Url::parse("http://localhost:9999/callback?error=access_denied&state=s1").expect("url");
+        assert!(matches!(
+            classify_callback_url(&url, &f),
+            CallbackVerdict::IdpError(_)
+        ));
     }
 
     #[test]
