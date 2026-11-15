@@ -337,6 +337,19 @@ impl ServerState {
 
 /// The per-process OAuth manager. Cheap to share (`Arc`); construct once in
 /// runtime assembly and hand it to every `connect_all` path.
+/// A status row for one OAuth MCP server, deliberately free of token
+/// material: `zeroclaw mcp status` must never print what a bearer token
+/// is, only that a grant exists and when it dies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSummary {
+    pub client_id: String,
+    pub issuer: String,
+    pub scope: Option<String>,
+    /// RFC 3339, as the stored expiry instant.
+    pub expires_at: Option<String>,
+    pub has_refresh_token: bool,
+}
+
 pub struct McpOAuthManager {
     store: McpTokenStore,
     launcher: Arc<dyn BrowserLauncher>,
@@ -762,6 +775,61 @@ impl McpOAuthManager {
             .await
     }
 
+    /// The explicit admin sign-in behind `zeroclaw mcp signin` (design
+    /// §13.2): run a FRESH browser + paste sign-in for `config` even when
+    /// a live grant already exists, replacing the stored grant on
+    /// success. Always interactive: that is the command's whole point
+    /// (pre-authorizing a headless deployment from a terminal).
+    pub async fn force_signin(
+        &self,
+        config: &McpServerConfig,
+        www_authenticate: Option<&str>,
+    ) -> Result<()> {
+        let state = self.state_for(config)?;
+        self.ready(&state, www_authenticate).await?;
+        self.refresh
+            .run_exclusive(state.canonical.resource(), async {
+                // No live-grant short-circuit on purpose: `signin` means
+                // "re-mint it now". No §12 nesting either: `authorize`
+                // never re-enters `run_exclusive`.
+                self.authorize(&state, true, true).await.map(|_| ())
+            })
+            .await
+    }
+
+    /// What `zeroclaw mcp status` prints: the stored grant's shape for
+    /// `config`, with no token material in it (see [`GrantSummary`]).
+    /// `Ok(None)` means no stored sign-in for this server's resource.
+    pub async fn stored_grant_summary(
+        &self,
+        config: &McpServerConfig,
+    ) -> Result<Option<GrantSummary>> {
+        let state = self.state_for(config)?;
+        Ok(self
+            .store
+            .load_authorization(&state.canonical)
+            .await?
+            .map(|grant| GrantSummary {
+                client_id: grant.client_id,
+                issuer: grant.issuer.as_str().to_string(),
+                scope: grant.tokens.scope.clone(),
+                expires_at: grant.tokens.expires_at.map(|at| at.to_rfc3339()),
+                has_refresh_token: grant.tokens.refresh_token.is_some(),
+            }))
+    }
+
+    /// What `zeroclaw mcp signout` does: delete the stored grant for
+    /// `config` (and the in-process copy), reporting whether one was
+    /// there. The minted tokens stay valid at the authorization server —
+    /// revocation is not part of this contract — so a RUNNING daemon may
+    /// still hold the access token in memory until it expires; restart it
+    /// (or `force_signin`) to make removal effective immediately.
+    pub async fn signout(&self, config: &McpServerConfig) -> Result<bool> {
+        let state = self.state_for(config)?;
+        *state.grant.write().await = None;
+        self.store.remove_authorization(&state.canonical).await
+    }
+
     /// React to a 401 the transport just observed. `used_token` is the
     /// bearer the failed request carried. Returns the bearer to RETRY with
     /// (safe methods only — the caller enforces the method allowlist).
@@ -1182,7 +1250,8 @@ impl McpOAuthManager {
                                         Exchange::NeedsSignin(err)
                                     } else {
                                         Exchange::Failed(err.context(format!(
-                                            "MCP server `{}`: the stored OAuth sign-in was rejected by the authorization server; reconnect from an interactive ZeroClaw to sign in again",
+                                            "MCP server `{}`: the stored OAuth sign-in was rejected by the authorization server; run `zeroclaw mcp signin {}` from an interactive terminal to sign in again",
+                                            state.policy().config.name,
                                             state.policy().config.name
                                         )))
                                     }
@@ -1912,11 +1981,11 @@ impl McpOAuthManager {
         let policy = state.policy();
         if !interactive {
             bail!(
-                "MCP server `{}` requires an OAuth sign-in that must be started from an \
-                 interactive session (the background runtime never opens a browser); connect \
-                 once from an interactive ZeroClaw to authorize {}",
+                "MCP server `{}` requires an OAuth sign-in that the background runtime \
+                 never starts; run `zeroclaw mcp signin {}` from an interactive terminal \
+                 to sign in",
                 policy.config.name,
-                state.canonical.resource()
+                policy.config.name
             );
         }
         let discovery = state
@@ -2629,7 +2698,7 @@ mod tests {
             .await
             .expect_err("discovery now succeeds; background mode still needs a sign-in");
         assert!(
-            err.to_string().contains("interactive session"),
+            err.to_string().contains("zeroclaw mcp signin"),
             "second attempt must be past discovery, got: {err}"
         );
 
@@ -2978,7 +3047,7 @@ mod tests {
         .expect("re-authorizing after grant death must not hang");
         let err = result.expect_err("background mode cannot sign in");
         assert!(
-            err.to_string().contains("interactive session"),
+            err.to_string().contains("zeroclaw mcp signin"),
             "got: {err}"
         );
     }
@@ -3131,7 +3200,7 @@ mod tests {
         .expect("no deadlock")
         .expect_err("issuer drift resolves to sign-in, and background cannot sign in");
         assert!(
-            err.to_string().contains("interactive session"),
+            err.to_string().contains("zeroclaw mcp signin"),
             "got: {err}"
         );
         let sent = far.received_requests().await.unwrap_or_default();
@@ -3187,7 +3256,7 @@ mod tests {
             .await
             .expect_err("no grant yet");
         assert!(
-            err.to_string().contains("interactive session"),
+            err.to_string().contains("zeroclaw mcp signin"),
             "got: {err}"
         );
 
@@ -3737,6 +3806,197 @@ mod tests {
             .await
             .expect("browser callback still completes the flow");
         assert_eq!(bearer, "Bearer at-1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn force_signin_replaces_a_live_grant_and_survives_headless() {
+        // Design §13.2: `zeroclaw mcp signin` re-mints on purpose (a live
+        // grant must NOT short-circuit it the way `bearer_for` does), and
+        // the replacement is what a later background process loads.
+        let stub = stub(
+            Some(serde_json::json!({"client_id": "dyn-cid"})),
+            vec![
+                (
+                    200,
+                    serde_json::json!({"access_token": "at-1", "refresh_token": "rt-1", "expires_in": 3600, "token_type": "Bearer"}),
+                ),
+                (
+                    200,
+                    serde_json::json!({"access_token": "at-2", "refresh_token": "rt-2", "expires_in": 3600, "token_type": "Bearer"}),
+                ),
+            ],
+        )
+        .await;
+        let launcher = Arc::new(AutoCallbackLauncher {
+            code: "the-code",
+            fail: false,
+            launches: AtomicUsize::new(0),
+        });
+        let manager = manager_with(&stub, launcher.clone());
+        let first = manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect("first sign-in");
+        assert_eq!(first, "Bearer at-1");
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 1);
+
+        manager
+            .force_signin(&stub.store, None)
+            .await
+            .expect("explicit signin");
+        // The second browser leg really ran: force_signin did not ride the
+        // live grant, it re-opened the flow.
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 2);
+        let canonical = CanonicalResource::from_configured(
+            &Url::parse(&format!("{}/mcp", stub.mcp.uri())).expect("url"),
+        )
+        .expect("canonical");
+        let loaded = manager
+            .store
+            .load_authorization(&canonical)
+            .await
+            .expect("load")
+            .expect("still stored");
+        assert_eq!(loaded.tokens.access_token, "at-2");
+
+        // A fresh manager (the headless daemon's stand-in) uses the
+        // replacement with no browser involvement at all.
+        struct Never;
+        impl BrowserLauncher for Never {
+            fn launch(&self, _url: &Url) -> Result<()> {
+                unreachable!("a stored live grant must not open a browser")
+            }
+        }
+        let headless =
+            McpOAuthManager::with_launcher(stub.tmp.path(), true, Arc::new(Never)).expect("m");
+        let bearer = headless
+            .bearer_for(&stub.store, None, false)
+            .await
+            .expect("background reuse of the admin sign-in");
+        assert_eq!(bearer, "Bearer at-2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn summary_describes_the_grant_without_token_material() {
+        let stub = stub(
+            Some(serde_json::json!({"client_id": "dyn-cid"})),
+            vec![(
+                200,
+                serde_json::json!({"access_token": "at-1", "refresh_token": "rt-1", "expires_in": 3600, "expires_in_note": "Bearer", "scope": "mcp:tools", "token_type": "Bearer"}),
+            )],
+        )
+        .await;
+        let manager = manager_with(
+            &stub,
+            Arc::new(AutoCallbackLauncher {
+                code: "the-code",
+                fail: false,
+                launches: AtomicUsize::new(0),
+            }),
+        );
+        assert!(
+            manager
+                .stored_grant_summary(&stub.store)
+                .await
+                .expect("none")
+                .is_none(),
+            "no grant before the first sign-in"
+        );
+        // `status` is a pure store read: no discovery, no DCR, no token
+        // call, no callback port - nothing reached the wire yet.
+        assert!(stub.as_.received_requests().await.expect("as").is_empty());
+        assert!(stub.mcp.received_requests().await.expect("mcp").is_empty());
+        manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect("interactive flow");
+        let summary = manager
+            .stored_grant_summary(&stub.store)
+            .await
+            .expect("summary")
+            .expect("grant present");
+        assert_eq!(summary.client_id, "dyn-cid");
+        assert_eq!(summary.scope.as_deref(), Some("mcp:tools"));
+        assert!(summary.has_refresh_token);
+        assert!(
+            summary.expires_at.is_some(),
+            "expiry is part of the status row"
+        );
+        assert!(
+            summary.issuer.starts_with("http"),
+            "issuer: {}",
+            summary.issuer
+        );
+        let rendered = format!("{summary:?}");
+        assert!(
+            !rendered.contains("at-1") && !rendered.contains("rt-1"),
+            "the status view must never carry token material: {rendered}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn signout_removes_the_grant_and_reports_what_it_found() {
+        let stub = stub(
+            Some(serde_json::json!({"client_id": "dyn-cid"})),
+            paste_stub_tokens(),
+        )
+        .await;
+        let manager = manager_with(
+            &stub,
+            Arc::new(AutoCallbackLauncher {
+                code: "the-code",
+                fail: false,
+                launches: AtomicUsize::new(0),
+            }),
+        );
+        manager
+            .bearer_for(&stub.store, None, true)
+            .await
+            .expect("interactive flow");
+        assert!(
+            manager
+                .stored_grant_summary(&stub.store)
+                .await
+                .expect("some")
+                .is_some()
+        );
+
+        assert!(
+            manager.signout(&stub.store).await.expect("signout"),
+            "first removal"
+        );
+        assert!(
+            manager
+                .stored_grant_summary(&stub.store)
+                .await
+                .expect("gone")
+                .is_none()
+        );
+        assert!(
+            !manager.signout(&stub.store).await.expect("second signout"),
+            "idempotent"
+        );
+
+        // After signout the background posture is locked out again: no
+        // grant, no browser, actionable error pointing at the admin CLI.
+        struct Never;
+        impl BrowserLauncher for Never {
+            fn launch(&self, _url: &Url) -> Result<()> {
+                unreachable!("background must not open a browser")
+            }
+        }
+        let headless =
+            McpOAuthManager::with_launcher(stub.tmp.path(), true, Arc::new(Never)).expect("m");
+        let err = headless
+            .bearer_for(&stub.store, None, false)
+            .await
+            .expect_err("signout must lock background out");
+        let msg = err.to_string();
+        assert!(msg.contains("interactive"), "got: {msg}");
+        assert!(
+            msg.contains("zeroclaw mcp signin mgr-test"),
+            "the background error must name the admin command: {msg}"
+        );
     }
 
     fn urlencoded(s: &str) -> String {
@@ -4293,7 +4553,7 @@ mod tests {
             .expect_err("a dead grant must not hand out an expired bearer");
         let text = err.to_string();
         assert!(
-            text.contains("interactive ZeroClaw") || text.contains("sign in again"),
+            text.contains("zeroclaw mcp signin") || text.contains("sign in again"),
             "expected an actionable reauthorization error, got: {text}"
         );
         let state = manager.state_for(&stub.store).expect("state");
@@ -4359,7 +4619,7 @@ mod tests {
             .await
             .expect_err("a terminally rejected grant must not hand out the carried bearer");
         assert!(
-            err.to_string().contains("interactive ZeroClaw"),
+            err.to_string().contains("zeroclaw mcp signin"),
             "the call must land in the sign-in decision, got: {err}"
         );
 
