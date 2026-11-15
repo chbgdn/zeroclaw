@@ -178,11 +178,18 @@ Sign-in only runs from an **interactive** ZeroClaw: a process with both stdin
 and stderr attached to a terminal. Any assembly running without an attached
 terminal (a detached daemon or service, and the gateway, channel, cron, eval,
 and ACP turns it runs headless) never prints a URL, never binds a callback
-port, and fails a first sign-in with an actionable "connect once from an
-interactive session" error instead. Note that `zeroclaw daemon` started in the
-foreground of a terminal is interactive by this rule: a sign-in triggered
-from one of its turns prints the URL and can hold that turn up to the 5-minute
-wait.
+port, and fails a first sign-in with an actionable error telling you to run
+`zeroclaw mcp signin <server>` from an interactive terminal instead. Note that
+`zeroclaw daemon` started in the foreground of a terminal is interactive by
+this rule: a sign-in triggered from one of its turns prints the URL and can
+hold that turn up to the 5-minute wait. A headless deployment can be
+pre-authorized from any terminal with `zeroclaw mcp signin <server>` (on a
+container: `docker exec -it <container> zeroclaw mcp signin <server>`, where
+the command's own stdin TTY and the paste fallback make the flow work even
+when the browser is elsewhere), and the detached daemon then runs on the
+stored grant. If the daemon is already running, restart it after
+`zeroclaw mcp signin` as well: a running daemon does not reload the store,
+and its own refresh can write the old grant back over the new one.
 
 Token lifecycle: tokens are refreshed proactively before expiry and once per
 401. On the `http` transport the request is then retried exactly once when
@@ -282,9 +289,11 @@ firewall blocking loopback listens (wait times out after 5 minutes);
 `invalid_grant` → the
 stored grant was revoked server-side; the grant is cleared and a fresh sign-in
 is requested automatically. Changing the AS URL behind a stored grant likewise
-signs the server out by design. To sign out manually, delete the server's
-`mcp:oauth@…` profile from `auth-profiles.json` in the config directory while
-ZeroClaw is stopped.
+signs the server out by design. To sign out, run `zeroclaw mcp signout
+<server>`: it removes the stored grant, but the minted tokens are not revoked,
+so they stay valid at the authorization server until they expire, and a
+running daemon keeps its in-memory copy until then, so restart the daemon to
+make the removal effective.
 
 Aliases of one URL share one grant: the stored grant is keyed by the
 canonical MCP resource URL, not by `name`, so running two `[[mcp.servers]]`

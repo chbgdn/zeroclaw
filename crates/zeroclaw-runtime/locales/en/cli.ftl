@@ -1319,6 +1319,24 @@ cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
 cli-models-status-current = Default model: { $model } (provider: { $provider })
 cli-models-status-none = No default model configured.
 
+# ── mcp oauth sign-in (zeroclaw mcp signin|status|signout) ──
+# One row per stored grant: identifiers and an expiry stamp only, never
+# token material. `-` means the grant carries no scope, `unknown` means no
+# stored expiry, and the refresh column answers whether a refresh token is
+# stored. The sign-out caveat (tokens stay valid at the authorization
+# server until expiry; restart the daemon to drop its in-memory copy) is
+# documented in `docs/book/src/tools/mcp.md`.
+cli-mcp-signin-no-browser = Sign-in for MCP server "{$server}" is starting without a browser: the sign-in prints the authorization URL, open it in any browser, then paste the browser's final redirect URL back here.
+cli-mcp-signin-done = Signed in to MCP server "{$server}".
+cli-mcp-status-row = {"  "}{$server}  client_id={$client_id}  issuer={$issuer}  scope={$scope}  expires={$expires}  refresh={$refresh}
+cli-mcp-status-none = MCP server "{$server}" is not signed in.
+cli-mcp-status-no-oauth-servers = No MCP servers are configured with oauth = true, so there is no sign-in status to show.
+cli-mcp-signout-removed = Removed the stored sign-in for MCP server "{$server}".
+cli-mcp-signout-nothing-stored = MCP server "{$server}" has no stored sign-in to remove.
+cli-mcp-server-unknown = No MCP server named "{$server}" is configured. Configured servers: {$names}.
+cli-mcp-server-stdio = MCP server "{$server}" is a local stdio server; ZeroClaw never signs it in over OAuth.
+cli-mcp-oauth-not-enabled = MCP server "{$server}" does not have oauth = true, so ZeroClaw has no sign-in to run for it.
+
 # ── Agent turn-engine user-visible markers (#7415) ────────────────────
 # Appended to (or persisted as) assistant output when a turn is cut short;
 # shown to end users across every transport (channels, WS, RPC, ACP, CLI).
