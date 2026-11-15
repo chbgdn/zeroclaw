@@ -1405,6 +1405,14 @@ Examples:
         tools: Vec<String>,
     },
 
+    /// Manage operator sign-in for OAuth-enabled remote MCP servers
+    /// (`zeroclaw mcp signin|status|signout <server>`). With no subcommand,
+    /// prints sign-in status for every `oauth = true` server.
+    Mcp {
+        #[command(subcommand)]
+        mcp_command: Option<McpSubcommands>,
+    },
+
     /// Configure and manage scheduled tasks
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -8658,6 +8666,34 @@ enum EstopSubcommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum McpSubcommands {
+    /// Run a fresh interactive OAuth sign-in for one MCP server, even when
+    /// a grant is already stored. Prints the authorization URL, tries the
+    /// browser, and accepts a pasted redirect URL when the browser cannot
+    /// reach this machine.
+    Signin {
+        /// Server name from `[[mcp.servers]]`.
+        server: String,
+        /// Do not open a browser here: open the printed authorization URL
+        /// anywhere and paste the final redirect URL back on stdin.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Show the stored OAuth grant for one server, or for every
+    /// `oauth = true` server when no name is given. Never prints tokens.
+    Status {
+        /// Server name from `[[mcp.servers]]`. Omit to list all.
+        server: Option<String>,
+    },
+    /// Remove the stored OAuth grant for one MCP server. The minted tokens
+    /// stay valid at the authorization server until they expire.
+    Signout {
+        /// Server name from `[[mcp.servers]]`.
+        server: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum AuthCommands {
     /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
     Login {
@@ -12244,6 +12280,8 @@ Add pricing to the active provider profile or supply a catalog entry."
             tools,
         } => handle_estop_command(&config, estop_command, level, domains, tools),
 
+        Commands::Mcp { mcp_command } => Box::pin(handle_mcp_command(mcp_command, &config)).await,
+
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
@@ -14420,6 +14458,241 @@ fn print_estop_status(state: &security::EstopState) {
                 "updated_at"
             )
         );
+    }
+}
+
+/// A launcher that opens nothing, for `zeroclaw mcp signin --no-browser`.
+/// The sign-in always prints the authorization URL itself, and the
+/// manual-paste fallback still finishes the flow on stdin, so the operator
+/// can open the URL on any machine (browser elsewhere, container, SSH).
+#[cfg(feature = "agent-runtime")]
+struct NoBrowserLauncher;
+
+#[cfg(feature = "agent-runtime")]
+impl zeroclaw_tools::mcp_oauth::browser::BrowserLauncher for NoBrowserLauncher {
+    fn launch(&self, _url: &reqwest::Url) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Resolve an operator-chosen server name to its exact `[[mcp.servers]]`
+/// entry and refuse entries that do not sign in through OAuth. The stored
+/// grant is keyed by canonical resource URL; the name is the operator's
+/// alias, and this is the single name-to-entry lookup the command surface
+/// performs.
+#[cfg(feature = "agent-runtime")]
+fn mcp_oauth_server<'a>(
+    config: &'a Config,
+    name: &str,
+) -> Result<&'a zeroclaw_config::schema::McpServerConfig> {
+    let entry = config
+        .mcp
+        .servers
+        .iter()
+        .find(|server| server.name == name)
+        .with_context(|| {
+            let names = if config.mcp.servers.is_empty() {
+                "(none)".to_string()
+            } else {
+                config
+                    .mcp
+                    .servers
+                    .iter()
+                    .map(|server| server.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            ta(
+                "cli-mcp-server-unknown",
+                &[("server", name), ("names", &names)],
+                "No MCP server named \"{$server}\" is configured. Configured servers: {$names}.",
+            )
+        })?;
+    // Mirror the daemon wiring's rule (mcp_oauth_wiring `any_oauth_server`):
+    // a local stdio child has no HTTP surface to authorize, so it is never
+    // an OAuth server regardless of what the entry says.
+    if entry.transport == zeroclaw_config::schema::McpTransport::Stdio {
+        bail!(
+            "{}",
+            ta(
+                "cli-mcp-server-stdio",
+                &[("server", name)],
+                "MCP server \"{$server}\" is a local stdio server; ZeroClaw never signs it in over OAuth.",
+            )
+        );
+    }
+    if !entry.oauth {
+        bail!(
+            "{}",
+            ta(
+                "cli-mcp-oauth-not-enabled",
+                &[("server", name)],
+                "MCP server \"{$server}\" does not have oauth = true, so ZeroClaw has no sign-in to run for it.",
+            )
+        );
+    }
+    Ok(entry)
+}
+
+/// One `status` row for a stored grant: identifiers and an expiry stamp
+/// only. `GrantSummary` carries no token material by construction, so this
+/// rendering cannot print one; an absent scope or expiry renders as `-` and
+/// `unknown` so every row still shows every field.
+#[cfg(feature = "agent-runtime")]
+fn mcp_status_row(name: &str, grant: &zeroclaw_tools::mcp_oauth::GrantSummary) -> String {
+    ta(
+        "cli-mcp-status-row",
+        &[
+            ("server", name),
+            ("client_id", grant.client_id.as_str()),
+            ("issuer", grant.issuer.as_str()),
+            ("scope", grant.scope.as_deref().unwrap_or("-")),
+            ("expires", grant.expires_at.as_deref().unwrap_or("unknown")),
+            (
+                "refresh",
+                if grant.has_refresh_token { "yes" } else { "no" },
+            ),
+        ],
+        "  {$server}  client_id={$client_id}  issuer={$issuer}  scope={$scope}  expires={$expires}  refresh={$refresh}",
+    )
+}
+
+/// One server's `status` line: the stored grant row, or an explicit
+/// not-signed-in line when no grant is stored.
+#[cfg(feature = "agent-runtime")]
+async fn print_mcp_grant_status(
+    manager: &zeroclaw_tools::mcp_oauth::McpOAuthManager,
+    entry: &zeroclaw_config::schema::McpServerConfig,
+) -> Result<()> {
+    match manager.stored_grant_summary(entry).await? {
+        Some(grant) => println!("{}", mcp_status_row(&entry.name, &grant)),
+        None => println!(
+            "{}",
+            ta(
+                "cli-mcp-status-none",
+                &[("server", &entry.name)],
+                "MCP server \"{$server}\" is not signed in.",
+            )
+        ),
+    }
+    Ok(())
+}
+
+/// The `zeroclaw mcp signin|status|signout` group: the explicit admin
+/// host for MCP OAuth sign-in (predictable timing, `--no-browser`, and a
+/// real terminal for the manual-paste fallback) instead of a sign-in that
+/// piggybacks on an agent turn. The token store must stay byte-identical
+/// to the daemon's, so the state dir and encryption posture come from the
+/// same canonical resolvers the daemon wiring uses.
+#[cfg(feature = "agent-runtime")]
+async fn handle_mcp_command(mcp_command: Option<McpSubcommands>, config: &Config) -> Result<()> {
+    use zeroclaw_tools::mcp_oauth::McpOAuthManager;
+    use zeroclaw_tools::mcp_oauth::browser::SystemBrowserLauncher;
+
+    // `zeroclaw mcp` with no subcommand behaves like `status` with no
+    // server: the read-only default, the same bare-command pattern the
+    // other Option-wrapped groups follow.
+    let command = mcp_command.unwrap_or(McpSubcommands::Status { server: None });
+    let state_dir = zeroclaw_providers::auth::state_dir_from_config(config);
+
+    match command {
+        McpSubcommands::Signin { server, no_browser } => {
+            let entry = mcp_oauth_server(config, &server)?;
+            let manager = if no_browser {
+                McpOAuthManager::with_launcher(
+                    &state_dir,
+                    config.secrets.encrypt,
+                    Arc::new(NoBrowserLauncher),
+                )?
+            } else {
+                McpOAuthManager::with_launcher(
+                    &state_dir,
+                    config.secrets.encrypt,
+                    Arc::new(SystemBrowserLauncher),
+                )?
+            };
+            if no_browser {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-mcp-signin-no-browser",
+                        &[("server", &server)],
+                        "Sign-in for MCP server \"{$server}\" is starting without a browser: the sign-in prints the authorization URL, open it in any browser, then paste the browser's final redirect URL back here.",
+                    )
+                );
+            }
+            // `force_signin` prints the authorization URL, drives the
+            // browser (unless suppressed above), and accepts the pasted
+            // redirect when the loopback callback cannot arrive.
+            manager.force_signin(entry, None).await?;
+            println!(
+                "{}",
+                ta(
+                    "cli-mcp-signin-done",
+                    &[("server", &server)],
+                    "Signed in to MCP server \"{$server}\".",
+                )
+            );
+            Ok(())
+        }
+        McpSubcommands::Status { server } => {
+            let manager = McpOAuthManager::new(&state_dir, config.secrets.encrypt)?;
+            match server {
+                Some(name) => {
+                    let entry = mcp_oauth_server(config, &name)?;
+                    print_mcp_grant_status(&manager, entry).await
+                }
+                None => {
+                    let servers: Vec<_> = config
+                        .mcp
+                        .servers
+                        .iter()
+                        .filter(|entry| {
+                            entry.oauth
+                                && entry.transport != zeroclaw_config::schema::McpTransport::Stdio
+                        })
+                        .collect();
+                    if servers.is_empty() {
+                        println!(
+                            "{}",
+                            t(
+                                "cli-mcp-status-no-oauth-servers",
+                                "No MCP servers are configured with oauth = true, so there is no sign-in status to show.",
+                            )
+                        );
+                        return Ok(());
+                    }
+                    for entry in servers {
+                        print_mcp_grant_status(&manager, entry).await?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+        McpSubcommands::Signout { server } => {
+            let entry = mcp_oauth_server(config, &server)?;
+            let manager = McpOAuthManager::new(&state_dir, config.secrets.encrypt)?;
+            if manager.signout(entry).await? {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-mcp-signout-removed",
+                        &[("server", &server)],
+                        "Removed the stored sign-in for MCP server \"{$server}\".",
+                    )
+                );
+            } else {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-mcp-signout-nothing-stored",
+                        &[("server", &server)],
+                        "MCP server \"{$server}\" has no stored sign-in to remove.",
+                    )
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -18599,6 +18872,173 @@ mod tests {
                 standard: true,
             } if version == "0.9.0"
         ));
+    }
+
+    #[test]
+    fn mcp_cli_parses_signin_with_and_without_no_browser() {
+        let cli =
+            Cli::try_parse_from(["zeroclaw", "mcp", "signin", "silpo"]).expect("mcp signin parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Mcp {
+                mcp_command: Some(McpSubcommands::Signin {
+                    ref server,
+                    no_browser: false,
+                })
+            } if server == "silpo"
+        ));
+
+        let cli = Cli::try_parse_from(["zeroclaw", "mcp", "signin", "silpo", "--no-browser"])
+            .expect("mcp signin --no-browser parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Mcp {
+                mcp_command: Some(McpSubcommands::Signin {
+                    ref server,
+                    no_browser: true,
+                })
+            } if server == "silpo"
+        ));
+    }
+
+    #[test]
+    fn mcp_cli_parses_status_all_status_one_and_signout() {
+        let cli = Cli::try_parse_from(["zeroclaw", "mcp", "status"]).expect("mcp status parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Mcp {
+                mcp_command: Some(McpSubcommands::Status { server: None })
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["zeroclaw", "mcp", "status", "silpo"])
+            .expect("mcp status one parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Mcp {
+                mcp_command: Some(McpSubcommands::Status { ref server })
+            } if server.as_deref() == Some("silpo")
+        ));
+
+        let cli = Cli::try_parse_from(["zeroclaw", "mcp", "signout", "silpo"])
+            .expect("mcp signout parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Mcp {
+                mcp_command: Some(McpSubcommands::Signout { ref server })
+            } if server == "silpo"
+        ));
+
+        // A bare `zeroclaw mcp` keeps the subcommand optional, like the
+        // other Option-wrapped groups; dispatch defaults it to status-all.
+        let cli = Cli::try_parse_from(["zeroclaw", "mcp"]).expect("bare mcp parses");
+        assert!(matches!(cli.command, Commands::Mcp { mcp_command: None }));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn mcp_status_row_fills_absent_fields_without_leaking_tokens() {
+        use zeroclaw_tools::mcp_oauth::GrantSummary;
+
+        let row = mcp_status_row(
+            "silpo",
+            &GrantSummary {
+                client_id: "dcr-9f2c".to_string(),
+                issuer: "https://auth.silpo.example".to_string(),
+                scope: None,
+                expires_at: Some("2026-11-15T05:00:00+00:00".to_string()),
+                has_refresh_token: true,
+            },
+        );
+        assert!(row.contains("silpo") && row.contains("dcr-9f2c"));
+        assert!(row.contains("https://auth.silpo.example"));
+        assert!(row.contains("2026-11-15T05:00:00+00:00"));
+        assert!(row.contains("refresh=yes"));
+        // An absent scope renders as the dash placeholder, never as `None`.
+        assert!(row.contains("scope=-") && !row.contains("None"));
+        // The row is field names plus identifiers only: `GrantSummary`
+        // carries no token fields, so no token value can appear, and the
+        // word itself names no field on this row.
+        assert!(!row.contains("token"));
+
+        let row = mcp_status_row(
+            "silpo",
+            &GrantSummary {
+                client_id: "dcr-9f2c".to_string(),
+                issuer: "https://auth.silpo.example".to_string(),
+                scope: Some("mcp:tools".to_string()),
+                expires_at: None,
+                has_refresh_token: false,
+            },
+        );
+        assert!(row.contains("scope=mcp:tools"));
+        assert!(row.contains("expires=unknown"));
+        assert!(row.contains("refresh=no"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn mcp_oauth_server_guards_unknown_names_oauth_and_stdio() {
+        use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+
+        let mut config = Config::default();
+        config.mcp.servers = vec![
+            McpServerConfig {
+                name: "silpo".to_string(),
+                transport: zeroclaw_config::schema::McpTransport::Http,
+                url: Some("https://mcp.silpo.example/mcp".to_string()),
+                oauth: true,
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "quiet".to_string(),
+                transport: zeroclaw_config::schema::McpTransport::Http,
+                url: Some("https://quiet.example/mcp".to_string()),
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "local".to_string(),
+                transport: McpTransport::Stdio,
+                oauth: true,
+                ..Default::default()
+            },
+        ];
+
+        mcp_oauth_server(&config, "silpo").expect("oauth http entry resolves");
+
+        let err = mcp_oauth_server(&config, "nope").expect_err("unknown name refuses");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nope") && msg.contains("silpo") && msg.contains("local"),
+            "got: {msg}"
+        );
+
+        let err = mcp_oauth_server(&config, "quiet").expect_err("oauth = false refuses");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("quiet") && msg.contains("oauth = true"),
+            "got: {msg}"
+        );
+
+        let err =
+            mcp_oauth_server(&config, "local").expect_err("stdio refuses even with oauth = true");
+        assert!(err.to_string().contains("stdio"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn mcp_signin_done_key_resolves_with_server_substitution() {
+        // Tests run against the embedded English catalogue, so this proves
+        // the shipped text and its placeholder substitution, not just the
+        // fallback.
+        let line = ta(
+            "cli-mcp-signin-done",
+            &[("server", "silpo")],
+            "unused fallback",
+        );
+        assert!(!line.is_empty());
+        assert!(line.contains("silpo"));
+        assert!(!line.contains("{$server}"));
     }
 
     #[test]
