@@ -3572,7 +3572,7 @@ impl OpenAiCompatibleModelProvider {
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
         let mut tool_name_map = std::collections::HashMap::new();
 
-        let native: Vec<NativeMessage> = messages
+        let mut native: Vec<NativeMessage> = messages
             .iter()
             .map(|message| {
                 if message.role == "assistant"
@@ -3743,38 +3743,31 @@ impl OpenAiCompatibleModelProvider {
                 // request when `role=tool` arrives without `tool_call_id`. Read
                 // the id out of the leading JSON envelope, ignoring trailing
                 // bytes, and fall back to the most recent assistant tool call.
-                let recovered_tool_call_id = (message.role == "tool").then(|| {
-                    let recovered = recover_leading_tool_call_id(&message.content)
-                        .map(|raw_id| {
-                            // Resolve through the same map the whole-envelope
-                            // branch uses: a contract that rewrites ids (Mistral
-                            // uses nine alphanumeric characters) must see the call
-                            // and its result carry the same id, or the request is
-                            // rejected just like the missing-field case.
-                            tool_call_id_map.get(raw_id.as_str()).cloned().unwrap_or_else(|| {
-                                let normalized = reserve_tool_call_id_for_contract(
-                                    targets_mistral_tool_call_contract,
-                                    Some(raw_id.clone()),
-                                    &mut used_tool_call_ids,
-                                );
-                                tool_call_id_map.insert(raw_id, normalized.clone());
-                                normalized
+                let recovered_tool_call_id = (message.role == "tool")
+                    .then(|| {
+                        recover_leading_tool_call_id(&message.content)
+                            .map(|raw_id| {
+                                // Resolve through the same map the whole-envelope
+                                // branch uses: a contract that rewrites ids (Mistral
+                                // uses nine alphanumeric characters) must see the call
+                                // and its result carry the same id, or the request is
+                                // rejected just like the missing-field case.
+                                tool_call_id_map
+                                    .get(raw_id.as_str())
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        let normalized = reserve_tool_call_id_for_contract(
+                                            targets_mistral_tool_call_contract,
+                                            Some(raw_id.clone()),
+                                            &mut used_tool_call_ids,
+                                        );
+                                        tool_call_id_map.insert(raw_id, normalized.clone());
+                                        normalized
+                                    })
                             })
-                        })
-                        .or_else(|| last_assistant_tool_call_ids.first().cloned());
-                    if recovered.is_none() {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({
-                                    "content_chars": message.content.chars().count(),
-                                })),
-                            "tool-result message serialized without tool_call_id: neither the leading envelope nor the preceding assistant turn supplied an id"
-                        );
-                    }
-                    recovered
-                }).flatten();
+                            .or_else(|| last_assistant_tool_call_ids.first().cloned())
+                    })
+                    .flatten();
                 NativeMessage {
                     role: message.role.clone(),
                     content: Some(self.message_content_for_role(
@@ -3791,6 +3784,39 @@ impl OpenAiCompatibleModelProvider {
                 }
             })
             .collect();
+
+        // Strict OpenAI-compatible providers (DeepSeek and the endpoints that
+        // share its deserializer) reject the ENTIRE request when any
+        // `role:"tool"` message lacks `tool_call_id`, so one dangling tool
+        // turn poisons the conversation permanently (the upstream 12263
+        // defect). The recovery above borrows an id whenever the history
+        // still holds one; when even
+        // that is impossible, no preceding assistant turn ever called a tool,
+        // so the result belongs to no call and dropping it strands nothing.
+        // Mirror of the Anthropic adapter's "envelope with no usable id is
+        // dropped" guarantee; the log keeps the drop visible to operators.
+        native.retain(|message| {
+            if message.role == "tool" && message.tool_call_id.is_none() {
+                let detail = match message.content.as_ref() {
+                    Some(MessageContent::Text(text)) => {
+                        ::serde_json::json!({ "content_chars": text.chars().count() })
+                    }
+                    Some(MessageContent::Parts(parts)) => {
+                        ::serde_json::json!({ "content_parts": parts.len() })
+                    }
+                    None => ::serde_json::json!({}),
+                };
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(detail),
+                    "dropped tool-result message without any recoverable tool_call_id: a strict provider would reject the whole request over it"
+                );
+                return false;
+            }
+            true
+        });
 
         // With the `relocate` policy, move `image_url` parts out of each
         // `role:"tool"` message into a following `role:"user"` message.
@@ -11764,6 +11790,43 @@ mod tests {
         );
     }
 
+    /// A `role=tool` row that no history can pair (the upstream 12263
+    /// defect) must never reach the wire: strict providers reject the whole
+    /// request over it, and every later turn in the same conversation fails
+    /// identically.
+    #[test]
+    fn convert_messages_for_native_drops_a_dangling_tool_result() {
+        let input = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::tool("plain tool output with no envelope"),
+        ];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert!(
+            !converted.iter().any(|m| m.role == "tool"),
+            "the orphan tool turn is dropped, not sent"
+        );
+        assert_eq!(converted.len(), 1, "the rest of the history rides along");
+    }
+
+    /// The pair of that row: when the preceding assistant turn did call a
+    /// tool, an unparseable envelope still borrows its id and the result
+    /// keeps riding (the upstream 12263 report asks for recovery before dropping).
+    #[test]
+    fn convert_messages_for_native_borrows_the_id_for_a_plain_tool_result() {
+        let input = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_9","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool("plain tool output with no envelope"),
+        ];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 3, "the borrowed id keeps the pair intact");
+        assert_eq!(converted[2].tool_call_id.as_deref(), Some("call_9"));
+    }
+
     #[tokio::test]
     async fn operator_max_images_bounds_the_outbound_request() {
         // Behaviour boundary: the number of images that survive into the
@@ -11936,9 +11999,17 @@ mod tests {
         // A raw non-JSON tool message is a legacy carrier: its body is text
         // under the attachment-identity contract, so even the omit policy
         // leaves it byte for byte — nothing was ever promoted from it.
-        let input = vec![ChatMessage::tool(
-            "malformed result [IMAGE:/tmp/secret.png]",
-        )];
+        // The history pairs it with the assistant call it answers, which is
+        // also what lets it carry that call's id (a legacy tool turn no
+        // history can pair is dropped instead; see the dangling-result
+        // tests).
+        let input = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_l","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool("malformed result [IMAGE:/tmp/secret.png]"),
+        ];
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
             .base_url("https://example.com")
@@ -11948,22 +12019,28 @@ mod tests {
             .build();
 
         let converted = provider.convert_messages_for_native(&input, true);
+        let tool = converted
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("the paired legacy tool message rides along");
         let content = serde_json::to_value(
-            converted[0]
-                .content
+            tool.content
                 .as_ref()
                 .expect("malformed tool message should carry content"),
         )
         .unwrap();
         let content = content.as_str().expect("legacy tool content is text");
 
-        assert_eq!(converted[0].role, "tool");
         assert_eq!(
             content, "malformed result [IMAGE:/tmp/secret.png]",
             "a legacy tool body passes through verbatim under omit"
         );
-        assert_eq!(converted[0].tool_call_id, None);
-        assert_eq!(converted[0].name, None);
+        assert_eq!(
+            tool.tool_call_id.as_deref(),
+            Some("call_l"),
+            "a paired legacy carrier borrows the id of the call it answers"
+        );
+        assert_eq!(tool.name, None);
     }
 
     #[test]
